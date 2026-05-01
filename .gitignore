@@ -1,0 +1,21 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+**/.zig-cache/
+**/zig-cache/
+**/zig-out/
+
+# Local toolchains and downloaded reference dependencies
+.toolchains/
+.deps/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+zig_btree.tar.gz
