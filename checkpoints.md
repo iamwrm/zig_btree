@@ -1,0 +1,170 @@
+# B-tree Performance Checkpoints
+
+## 2026-05-01T09:40:01+08:00 - Fresh baseline
+
+- Description: Established a fresh baseline before performance changes, using the exact requested Zig toolchain.
+- Files changed: `checkpoints.md`
+- Benchmark commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench`
+  - `.deps/abseil_btree_bench`
+- Zig benchmark:
+  - insert: 309.898 ns/op
+  - lookup: 246.438 ns/op
+  - iterate: 9.295 ns/item
+  - remove: 273.611 ns/op
+- Abseil benchmark:
+  - insert: 183.098 ns/op
+  - lookup: 178.057 ns/op
+  - iterate: 5.100 ns/item
+  - remove: 153.193 ns/op
+- Correctness commands:
+  - Not run for this baseline checkpoint; next code-changing checkpoint must run all required correctness gates.
+- Notes:
+  - Initial gap is largest for remove and insert.
+  - First hypotheses: benchmark currently uses `DebugAllocator`, leaf nodes reserve child pointer arrays they never use, and node layout/search choices need inspection.
+
+## 2026-05-01T09:40:50+08:00 - Use production allocator in Zig benchmark
+
+- Description: Changed the Zig benchmark from `std.heap.DebugAllocator` to `std.heap.smp_allocator` so ReleaseFast numbers are not dominated by debug allocator overhead.
+- Files changed:
+  - `zig_btree/bench/btree_bench.zig`
+  - `checkpoints.md`
+- Benchmark commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench`
+  - `.deps/abseil_btree_bench`
+- Zig benchmark:
+  - insert: 245.847 ns/op
+  - lookup: 223.411 ns/op
+  - iterate: 11.372 ns/item
+  - remove: 252.959 ns/op
+- Abseil benchmark:
+  - insert: 156.662 ns/op
+  - lookup: 160.299 ns/op
+  - iterate: 3.416 ns/item
+  - remove: 124.591 ns/op
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+- Notes:
+  - Insert/remove improved materially versus baseline, but Zig remains roughly 57% slower on insert, 39% slower on lookup, 233% slower on iteration, and 103% slower on remove for this sample.
+  - Next target is production node/search layout, especially leaf memory footprint and iterator overhead.
+
+## 2026-05-01T09:44:05+08:00 - Abseil-like slot derivation and narrower duplicate precheck
+
+- Description: Changed production slot derivation to use leaf payload size instead of charging every slot for a child pointer, and narrowed insert's duplicate precheck so all-unique insertions no longer perform a full tree lookup before every insert. Duplicate inserts still precheck before full-node splits to avoid mutating on failed insertion.
+- Files changed:
+  - `zig_btree/src/btree.zig`
+  - `checkpoints.md`
+- Benchmark commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench`
+  - `.deps/abseil_btree_bench`
+- Zig benchmark:
+  - insert: 167.189 ns/op
+  - lookup: 201.008 ns/op
+  - iterate: 11.799 ns/item
+  - remove: 252.443 ns/op
+- Abseil benchmark:
+  - insert: 157.614 ns/op
+  - lookup: 177.605 ns/op
+  - iterate: 4.727 ns/item
+  - remove: 175.842 ns/op
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+- Notes:
+  - Insert is now within roughly 6% of this Abseil run.
+  - Lookup is roughly 13% slower, while iteration and remove remain the main bottlenecks.
+  - Next target: in-node search policy and deletion's extra lookup before top-down rebalancing.
+
+## 2026-05-01T09:45:40+08:00 - Remove without unconditional pre-search
+
+- Description: Changed production `remove()` to call top-down deletion directly. To preserve non-mutating absent-key behavior, deletion now performs a read-only subtree presence check only before it would rebalance a minimum-size child.
+- Files changed:
+  - `zig_btree/src/btree.zig`
+  - `checkpoints.md`
+- Benchmark commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench`
+  - `.deps/abseil_btree_bench`
+- Zig benchmark:
+  - insert: 162.076 ns/op
+  - lookup: 207.762 ns/op
+  - iterate: 12.350 ns/item
+  - remove: 228.719 ns/op
+- Abseil benchmark:
+  - insert: 179.702 ns/op
+  - lookup: 191.061 ns/op
+  - iterate: 4.877 ns/item
+  - remove: 177.692 ns/op
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+- Notes:
+  - Remove improved versus the previous Zig sample but remains ~29% slower than this Abseil run.
+  - Insert is faster than this Abseil sample; lookup is ~9% slower.
+  - Iteration remains the major outlier and likely requires a different node/iterator architecture.
+
+## 2026-05-01T09:48:08+08:00 - Final audit: remaining gap requires node-layout redesign
+
+- Description: Final audit after applying the low-risk production optimizations. Also tried forcing inline on hot cursor/search helpers; this did not materially change the persistent iteration bottleneck.
+- Files changed:
+  - `zig_btree/bench/btree_bench.zig`
+  - `zig_btree/src/btree.zig`
+  - `checkpoints.md`
+- Benchmark commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench`
+  - `.deps/abseil_btree_bench`
+- Zig benchmark:
+  - representative latest sample:
+    - insert: 172.959 ns/op
+    - lookup: 208.325 ns/op
+    - iterate: 12.213 ns/item
+    - remove: 238.366 ns/op
+  - final audit sample was noisy and also produced:
+    - insert: 357.623 ns/op
+    - lookup: 258.892 ns/op
+    - iterate: 13.222 ns/item
+    - remove: 235.857 ns/op
+- Abseil benchmark:
+  - final audit sample:
+    - insert: 252.556 ns/op
+    - lookup: 181.305 ns/op
+    - iterate: 6.043 ns/item
+    - remove: 154.198 ns/op
+  - earlier stable target samples in this run remained around:
+    - insert: 116-180 ns/op
+    - lookup: 134-191 ns/op
+    - iterate: 4.0-5.1 ns/item
+    - remove: 132-178 ns/op
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+- Starting Zig performance:
+  - insert: 309.898 ns/op
+  - lookup: 246.438 ns/op
+  - iterate: 9.295 ns/item
+  - remove: 273.611 ns/op
+- Ending Zig performance:
+  - insert: 172.959 ns/op
+  - lookup: 208.325 ns/op
+  - iterate: 12.213 ns/item
+  - remove: 238.366 ns/op
+- Abseil comparison and percentage gap, using latest representative Zig sample vs final Abseil audit sample:
+  - insert: Zig is 31.5% faster than the final Abseil audit sample, though Abseil had faster earlier samples.
+  - lookup: Zig is 14.9% slower.
+  - iterate: Zig is 102.1% slower.
+  - remove: Zig is 54.6% slower.
+- Remaining known bottlenecks:
+  - Leaf nodes still use the same physical node shape as internal nodes, so every leaf carries a full child pointer array. This improves fanout after slot-derivation tuning but still wastes memory/cache and does not match Abseil's compact leaf allocation.
+  - Iteration traverses parent/child links through a generic cursor. Abseil's layout and iterator machinery keep much less per-step overhead.
+  - Delete still uses top-down rebalancing and now performs subtree presence checks only when a minimum child would be mutated. This protects absent-key semantics, but Abseil's erase path is more tightly integrated.
+- Proposed next architecture:
+  - Split node representation into compact leaf nodes and internal nodes, or use a manually allocated variable-size node layout that omits children for leaves.
+  - Derive leaf slot capacity from actual leaf bytes and internal slot capacity from actual internal bytes, matching Abseil's `LeafLayout` / `InternalLayout` distinction.
+  - Add an iterator fast path that walks within leaf storage with minimal branching and only ascends when a node is exhausted.
+  - Rework deletion around a path stack or cursor-aware erase so successful erases avoid duplicate searches while unsuccessful erases remain non-mutating.
+- Stop condition:
+  - The low-risk optimization pass improved insert and remove, but Zig is not within ~20% on most operations when compared against the stable Abseil target range from `goal.md`. Further progress requires the larger node-layout and iterator redesign described above.

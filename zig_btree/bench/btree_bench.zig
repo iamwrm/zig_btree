@@ -4,9 +4,7 @@ const btree = @import("btree");
 const Map = btree.AutoBTreeMapWithConfig(u64, u64, .{ .target_node_size = 256 });
 
 pub fn main() !void {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.smp_allocator;
 
     const n = 1_000_000;
 

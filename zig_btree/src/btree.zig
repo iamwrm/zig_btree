@@ -141,27 +141,27 @@ pub fn BTreeMap(
                 index: usize,
                 generation: usize,
 
-                pub fn isEnd(c: C) bool {
+                pub inline fn isEnd(c: C) bool {
                     return c.node == null;
                 }
 
-                pub fn entry(c: C) ?EntryPtr {
+                pub inline fn entry(c: C) ?EntryPtr {
                     c.assertValid();
                     const n = c.node orelse return null;
                     return &n.entries[c.index];
                 }
 
-                pub fn key(c: C) ?KeyPtr {
+                pub inline fn key(c: C) ?KeyPtr {
                     const e = c.entry() orelse return null;
                     return &e.key;
                 }
 
-                pub fn value(c: C) ?ValuePtr {
+                pub inline fn value(c: C) ?ValuePtr {
                     const e = c.entry() orelse return null;
                     return &e.value;
                 }
 
-                pub fn next(c: *C) ?EntryPtr {
+                pub inline fn next(c: *C) ?EntryPtr {
                     c.assertValid();
                     const n = c.node orelse return null;
                     const out = &n.entries[c.index];
@@ -169,7 +169,7 @@ pub fn BTreeMap(
                     return out;
                 }
 
-                pub fn prev(c: *C) ?EntryPtr {
+                pub inline fn prev(c: *C) ?EntryPtr {
                     c.assertValid();
                     if (c.node == null) c.retreat();
                     const out_node = c.node orelse return null;
@@ -178,7 +178,7 @@ pub fn BTreeMap(
                     return &out_node.entries[out_index];
                 }
 
-                pub fn advance(c: *C) void {
+                pub inline fn advance(c: *C) void {
                     c.assertValid();
                     const start = c.node orelse return;
                     if (!start.leaf) {
@@ -206,7 +206,7 @@ pub fn BTreeMap(
                     c.index = 0;
                 }
 
-                pub fn retreat(c: *C) void {
+                pub inline fn retreat(c: *C) void {
                     c.assertValid();
                     const start = c.node orelse {
                         c.node = c.tree.rightmostNode();
@@ -238,7 +238,7 @@ pub fn BTreeMap(
                     c.index = 0;
                 }
 
-                fn assertValid(c: C) void {
+                inline fn assertValid(c: C) void {
                     if (config.check_iterator_generation and safetyChecks()) {
                         std.debug.assert(c.generation == c.tree.generation);
                     }
@@ -249,7 +249,7 @@ pub fn BTreeMap(
         pub const Iterator = struct {
             cursor: Cursor,
 
-            pub fn next(it: *Iterator) ?*Entry {
+            pub inline fn next(it: *Iterator) ?*Entry {
                 return it.cursor.next();
             }
         };
@@ -257,7 +257,7 @@ pub fn BTreeMap(
         pub const ConstIterator = struct {
             cursor: ConstCursor,
 
-            pub fn next(it: *ConstIterator) ?*const Entry {
+            pub inline fn next(it: *ConstIterator) ?*const Entry {
                 return it.cursor.next();
             }
         };
@@ -265,7 +265,7 @@ pub fn BTreeMap(
         pub const ReverseIterator = struct {
             cursor: Cursor,
 
-            pub fn next(it: *ReverseIterator) ?*Entry {
+            pub inline fn next(it: *ReverseIterator) ?*Entry {
                 it.cursor.assertValid();
                 const n = it.cursor.node orelse return null;
                 const out_index = it.cursor.index;
@@ -277,7 +277,7 @@ pub fn BTreeMap(
         pub const ConstReverseIterator = struct {
             cursor: ConstCursor,
 
-            pub fn next(it: *ConstReverseIterator) ?*const Entry {
+            pub inline fn next(it: *ConstReverseIterator) ?*const Entry {
                 it.cursor.assertValid();
                 const n = it.cursor.node orelse return null;
                 const out_index = it.cursor.index;
@@ -366,19 +366,24 @@ pub fn BTreeMap(
                 return .{ .entry = &r.entries[0], .inserted = true };
             }
 
-            if (self.getEntry(entry_.key)) |existing| {
-                return .{ .entry = existing, .inserted = false };
-            }
-
             if (self.root.?.count() == max_slots) {
+                if (self.getEntry(entry_.key)) |existing| {
+                    return .{ .entry = existing, .inserted = false };
+                }
                 try self.growRoot();
             }
 
             var n = self.root.?;
             while (!n.leaf) {
                 var i = self.lowerBoundInNode(n, &entry_.key);
+                if (i < n.count() and self.keysEqual(&entry_.key, &n.entries[i].key)) {
+                    return .{ .entry = &n.entries[i], .inserted = false };
+                }
                 var child = childAt(n, i);
                 if (child.count() == max_slots) {
+                    if (self.getEntry(entry_.key)) |existing| {
+                        return .{ .entry = existing, .inserted = false };
+                    }
                     try self.splitChild(n, i);
                     if (self.less(&n.entries[i].key, &entry_.key)) {
                         i += 1;
@@ -389,6 +394,9 @@ pub fn BTreeMap(
             }
 
             const pos = self.lowerBoundInNode(n, &entry_.key);
+            if (pos < n.count() and self.keysEqual(&entry_.key, &n.entries[pos].key)) {
+                return .{ .entry = &n.entries[pos], .inserted = false };
+            }
             insertEntryAt(n, pos, entry_);
             self.len_ += 1;
             self.bumpGeneration();
@@ -414,12 +422,12 @@ pub fn BTreeMap(
 
         pub fn remove(self: *Self, key_: Key) bool {
             if (self.root == null) return false;
-            if (self.getEntry(key_) == null) return false;
             const removed = self.deleteFromNode(self.root.?, &key_);
-            std.debug.assert(removed);
-            self.len_ -= 1;
-            self.fixRootAfterDelete();
-            self.bumpGeneration();
+            if (removed) {
+                self.len_ -= 1;
+                self.fixRootAfterDelete();
+                self.bumpGeneration();
+            }
             return removed;
         }
 
@@ -698,9 +706,20 @@ pub fn BTreeMap(
             const child_index = idx;
             var child = childAt(n, child_index);
             if (child.count() == min_slots) {
+                if (!self.containsInSubtree(child, key_)) return false;
                 child = self.fillChild(n, child_index);
             }
             return self.deleteFromNode(child, key_);
+        }
+
+        fn containsInSubtree(self: *const Self, start: *const Node, key_: *const Key) bool {
+            var n = start;
+            while (true) {
+                const i = self.lowerBoundInNode(n, key_);
+                if (i < n.count() and self.keysEqual(key_, &n.entries[i].key)) return true;
+                if (n.leaf) return false;
+                n = childAt(n, i);
+            }
         }
 
         fn deleteFromInternal(self: *Self, n: *Node, idx: usize) bool {
@@ -829,7 +848,7 @@ pub fn BTreeMap(
             self.allocator.destroy(r);
         }
 
-        fn lowerBoundInNode(self: *const Self, n: *const Node, key_: *const Key) usize {
+        inline fn lowerBoundInNode(self: *const Self, n: *const Node, key_: *const Key) usize {
             if (max_slots <= config.linear_search_threshold) {
                 var i: usize = 0;
                 while (i < n.count() and self.less(&n.entries[i].key, key_)) : (i += 1) {}
@@ -844,7 +863,7 @@ pub fn BTreeMap(
             return lo;
         }
 
-        fn upperBoundInNode(self: *const Self, n: *const Node, key_: *const Key) usize {
+        inline fn upperBoundInNode(self: *const Self, n: *const Node, key_: *const Key) usize {
             if (max_slots <= config.linear_search_threshold) {
                 var i: usize = 0;
                 while (i < n.count() and !self.less(key_, &n.entries[i].key)) : (i += 1) {}
@@ -871,11 +890,11 @@ pub fn BTreeMap(
             return n;
         }
 
-        fn less(self: *const Self, a: *const Key, b: *const Key) bool {
+        inline fn less(self: *const Self, a: *const Key, b: *const Key) bool {
             return compare(&self.context, a, b) == .lt;
         }
 
-        fn keysEqual(self: *const Self, a: *const Key, b: *const Key) bool {
+        inline fn keysEqual(self: *const Self, a: *const Key, b: *const Key) bool {
             return compare(&self.context, a, b) == .eq;
         }
 
@@ -1069,7 +1088,12 @@ fn deriveMaxSlots(comptime Entry: type, comptime config: Config) usize {
     const ptr_size = @sizeOf(?*anyopaque);
     const entry_size = @max(@sizeOf(Entry), 1);
     const header_estimate = ptr_size + @sizeOf(u16) * 2 + @sizeOf(bool) + ptr_size;
-    const per_slot_estimate = entry_size + ptr_size;
+    // Abseil derives target slots from leaf-node payload: leaf nodes dominate
+    // node count and do not carry child pointers in Abseil's layout.  This
+    // implementation still uses a single node shape for now, but deriving
+    // slots from entries preserves Abseil-like fanout and avoids underfilled
+    // trees for common map entries such as u64 -> u64.
+    const per_slot_estimate = entry_size;
     var raw: usize = if (config.target_node_size > header_estimate)
         (config.target_node_size - header_estimate) / per_slot_estimate
     else
@@ -1100,7 +1124,7 @@ fn narrowPos(x: usize) u16 {
     return @as(u16, @intCast(x));
 }
 
-fn childAt(n: anytype, idx: usize) *@TypeOf(n.*) {
+inline fn childAt(n: anytype, idx: usize) *@TypeOf(n.*) {
     std.debug.assert(idx <= @as(usize, n.len));
     return n.children[idx].?;
 }
@@ -1119,14 +1143,14 @@ fn shiftChildrenRight(n: anytype, start: usize) void {
     }
 }
 
-fn insertEntryAt(n: anytype, idx: usize, entry: @TypeOf(n.entries[0])) void {
+inline fn insertEntryAt(n: anytype, idx: usize, entry: @TypeOf(n.entries[0])) void {
     std.debug.assert(@as(usize, n.len) < n.entries.len);
     shiftEntriesRight(n, idx);
     n.entries[idx] = entry;
     n.len += 1;
 }
 
-fn removeEntryAt(n: anytype, idx: usize) void {
+inline fn removeEntryAt(n: anytype, idx: usize) void {
     std.debug.assert(idx < @as(usize, n.len));
     var i = idx;
     while (i + 1 < @as(usize, n.len)) : (i += 1) {
