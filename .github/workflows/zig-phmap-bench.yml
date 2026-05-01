@@ -1,0 +1,116 @@
+name: zig_phmap_bench
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+
+    env:
+      ZIG_VERSION: 0.17.0-dev.135+9df02121d
+      ZIG: .toolchains/zig-x86_64-linux-0.17.0-dev.135+9df02121d/zig
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ curl xz-utils python3
+
+      - name: Download pinned Zig toolchain
+        run: |
+          mkdir -p .toolchains
+          curl -fsSL "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o ".toolchains/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar -C .toolchains -xf ".toolchains/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          "${ZIG}" version
+
+      - name: Download parallel-hashmap v2.0.0
+        run: |
+          mkdir -p .deps
+          curl -fsSL "https://github.com/greg7mdp/parallel-hashmap/archive/refs/tags/v2.0.0.tar.gz" \
+            -o .deps/parallel-hashmap-v2.0.0.tar.gz
+          tar -C .deps -xzf .deps/parallel-hashmap-v2.0.0.tar.gz
+
+      - name: Run Zig correctness gate
+        run: '"${ZIG}" build -Doptimize=ReleaseFast test'
+
+      - name: Build C++ parallel-hashmap benchmark
+        run: |
+          g++ -O3 -DNDEBUG -std=c++17 \
+            -I .deps/parallel-hashmap-2.0.0 \
+            zig_phmap/bench/parallel_hashmap_bench.cc \
+            -o .deps/parallel_hashmap_bench
+
+      - name: Run Zig benchmark
+        run: '"${ZIG}" build -Doptimize=ReleaseFast bench 2>&1 | tee zig-phmap-bench.txt'
+
+      - name: Run C++ parallel-hashmap benchmark
+        run: '.deps/parallel_hashmap_bench | tee cpp-parallel-hashmap-bench.txt'
+
+      - name: Compare benchmark output
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def parse(path):
+              out = {}
+              for line in Path(path).read_text().splitlines():
+                  m = re.match(r"([a-z_]+):\s+([0-9.]+) ns/(?:op|item)", line)
+                  if m:
+                      out[m.group(1)] = float(m.group(2))
+              return out
+
+          zig = parse("zig-phmap-bench.txt")
+          cpp = parse("cpp-parallel-hashmap-bench.txt")
+          keys = [
+              "insert_reserved",
+              "lookup_hit",
+              "lookup_miss",
+              "iterate",
+              "mixed",
+              "remove",
+              "string_insert",
+              "string_lookup",
+              "high_load_miss",
+              "tombstone_churn",
+          ]
+
+          lines = [
+              "# zig_phmap vs C++ parallel-hashmap",
+              "",
+              "| workload | Zig | C++ parallel-hashmap | Zig gap |",
+              "| --- | ---: | ---: | ---: |",
+          ]
+          for key in keys:
+              zv = zig.get(key)
+              cv = cpp.get(key)
+              if zv is None or cv is None:
+                  lines.append(f"| `{key}` | missing | missing | n/a |")
+                  continue
+              gap = ((zv / cv) - 1.0) * 100.0
+              lines.append(f"| `{key}` | {zv:.3f} | {cv:.3f} | {gap:+.1f}% |")
+
+          summary = "\n".join(lines) + "\n"
+          print(summary)
+          summary_path = Path.cwd() / "benchmark-summary.md"
+          summary_path.write_text(summary)
+          github_summary = Path(__import__("os").environ["GITHUB_STEP_SUMMARY"])
+          with github_summary.open("a") as f:
+              f.write(summary)
+          PY
+
+      - name: Upload benchmark logs
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: zig-phmap-vs-parallel-hashmap-bench
+          path: |
+            zig-phmap-bench.txt
+            cpp-parallel-hashmap-bench.txt
+            benchmark-summary.md

@@ -81,6 +81,38 @@ pub fn main() !void {
     }
     const string_lookup_ns = elapsedSince(&last);
 
+    const high_n: usize = 1_800_000;
+    const high_keys = try allocator.alloc(u64, high_n);
+    defer allocator.free(high_keys);
+    fillKeys(high_keys);
+    var high_map = Map.init(allocator);
+    defer high_map.deinit();
+    try high_map.ensureTotalCapacity(high_n);
+    for (high_keys, 0..) |key, i| {
+        _ = try high_map.put(key, @intCast(i));
+    }
+    last = nowNs();
+    for (high_keys) |key| {
+        if (high_map.getConst(key ^ 0x5555_5555_5555_5555)) |value| checksum +%= value.*;
+    }
+    const high_load_miss_ns = elapsedSince(&last);
+
+    const churn_n: usize = 500_000;
+    var churn_map = Map.init(allocator);
+    defer churn_map.deinit();
+    try churn_map.ensureTotalCapacity(churn_n);
+    last = nowNs();
+    for (keys[0..churn_n], 0..) |key, i| {
+        _ = try churn_map.put(key, @intCast(i));
+    }
+    for (keys[0..churn_n]) |key| {
+        _ = churn_map.remove(key);
+    }
+    for (keys[0..churn_n], 0..) |key, i| {
+        _ = try churn_map.put(key ^ 0x3333_3333_3333_3333, @intCast(i));
+    }
+    const tombstone_churn_ns = elapsedSince(&last);
+
     std.debug.print(
         \\items inserted: {}
         \\unique items: {}
@@ -92,6 +124,8 @@ pub fn main() !void {
         \\remove:          {d:.3} ns/op
         \\string_insert:   {d:.3} ns/op
         \\string_lookup:   {d:.3} ns/op
+        \\high_load_miss:  {d:.3} ns/op
+        \\tombstone_churn: {d:.3} ns/op
         \\checksum: {}
         \\
     , .{
@@ -105,6 +139,8 @@ pub fn main() !void {
         nsPerOp(remove_ns, n),
         nsPerOp(string_insert_ns, string_n),
         nsPerOp(string_lookup_ns, string_n),
+        nsPerOp(high_load_miss_ns, high_n),
+        nsPerOp(tombstone_churn_ns, churn_n * 3),
         checksum,
     });
 }

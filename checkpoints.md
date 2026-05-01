@@ -256,3 +256,185 @@
   - Add heterogeneous lookup adapters once the core layout is finalized.
 - Stop condition:
   - The first production pass is correct under the required gates and competitive or faster on insert, mixed, remove, and the borrowed byte-slice benchmark. It is not within the 20% target on hit lookup, miss lookup, or iteration. Further progress requires the group-control/SIMD layout redesign described above, plus a separate sharded-container design pass for the parallel API.
+
+# Goal 0003: parallel-hashmap Performance Parity Checkpoints
+
+## 2026-05-01T13:28:26+08:00 - Upstream probe and iterator source inspection
+
+- Description: Inspected upstream `parallel_hashmap/phmap.h` before making performance changes for Goal 0003.
+- Files changed:
+  - `checkpoints.md`
+- Source-inspection notes:
+  - Upstream control bytes use `kEmpty = 0x80`, `kDeleted = 0xfe`, and `kSentinel = 0xff`; full slots store a 7-bit H2 fingerprint.
+  - Upstream capacity is power-of-two-minus-one, so `(offset + i) & capacity` wraps probe offsets cheaply.
+  - The allocated control array has `capacity + Group::kWidth + 1` bytes: one sentinel at `ctrl[capacity]` plus cloned control bytes after the sentinel.
+  - `set_ctrl()` writes both the real control byte and its clone so unaligned group loads near the end can read without per-byte boundary checks.
+  - `find_impl()` loads a `Group`, checks only H2-matching candidates for equality, and returns unsuccessful as soon as `MatchEmpty()` is non-zero.
+  - `find_first_non_full()` uses group `MatchEmptyOrDeleted()` to find insertion targets.
+  - Iterators advance one slot, then `skip_empty_or_deleted()` uses `Group.CountLeadingEmptyOrDeleted()` to skip runs of special control bytes.
+  - `drop_deletes_without_resize()` converts deleted/full states and rebuilds probe placement without changing capacity when growth is exhausted but the table is sparse enough.
+- Benchmark commands:
+  - Not run for this source-inspection checkpoint.
+- Zig benchmark:
+  - Not run for this source-inspection checkpoint.
+- C++ `parallel-hashmap` benchmark:
+  - Not run for this source-inspection checkpoint.
+- Correctness commands:
+  - Not run for this source-inspection checkpoint.
+- Notes:
+  - The current Zig scalar linear probe cannot match upstream unsuccessful lookup because it tests one control byte at a time and cannot stop at group granularity.
+  - The current Zig iterator similarly scans one byte per slot; upstream skips empty/deleted runs with group masks.
+  - Next step is a fresh current-machine baseline, then a Zig group-control layout with cloned bytes and mask-based lookup/iteration.
+
+## 2026-05-01T13:29:07+08:00 - Pre-change baseline rerun
+
+- Description: Rebuilt the C++ benchmark and reran the current Zig and C++ benchmarks before changing the Zig hash table layout.
+- Files changed:
+  - `checkpoints.md`
+- Benchmark commands:
+  - `g++ -O3 -DNDEBUG -std=c++17 -I .deps/parallel-hashmap-2.0.0 .deps/parallel_hashmap_bench.cc -o .deps/parallel_hashmap_bench`
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench`
+  - `.deps/parallel_hashmap_bench`
+- Zig benchmark:
+  - insert_reserved: 54.943 ns/op
+  - lookup_hit: 22.206 ns/op
+  - lookup_miss: 22.335 ns/op
+  - iterate: 5.320 ns/item
+  - mixed: 74.029 ns/op
+  - remove: 17.700 ns/op
+  - string_insert: 15.853 ns/op
+  - string_lookup: 14.338 ns/op
+- C++ `parallel-hashmap` benchmark:
+  - insert_reserved: 26.992 ns/op
+  - lookup_hit: 12.110 ns/op
+  - lookup_miss: 3.617 ns/op
+  - iterate: 3.895 ns/item
+  - mixed: 35.267 ns/op
+  - remove: 22.910 ns/op
+  - string_insert: 38.916 ns/op
+  - string_lookup: 15.112 ns/op
+- Percentage gaps, Zig versus C++:
+  - insert_reserved: Zig is 103.6% slower.
+  - lookup_hit: Zig is 83.4% slower.
+  - lookup_miss: Zig is 517.5% slower.
+  - iterate: Zig is 36.6% slower.
+  - mixed: Zig is 109.9% slower.
+  - remove: Zig is 22.7% faster.
+  - string_insert: Zig is 59.3% faster.
+  - string_lookup: Zig is 5.1% faster.
+- Correctness commands:
+  - Not run for this benchmark-only checkpoint.
+- Notes:
+  - The current sample is noisier and materially worse than the Goal 0002 sample for insert and mixed, but the same structural bottlenecks remain: hit lookup, miss lookup, and iteration.
+  - Next optimization target is the group-control layout, which should reduce branch count and equality checks in lookup miss and let iteration skip groups of empty/deleted slots.
+
+## 2026-05-01T15:51:25+08:00 - Group-control probing reaches first parity sample
+
+- Description: Reworked the flat table around cloned control bytes and portable group probing. The final version in this checkpoint uses 8-byte portable groups, raw high-bit masks, H1/H2 hash splitting, cloned trailing control bytes, group-based insert targets, and group-mask iteration. An attempted per-group metadata cache was rejected because it increased insert/remove cost and did not improve lookup.
+- Files changed:
+  - `zig_phmap/src/phmap.zig`
+  - `checkpoints.md`
+- Benchmark commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench`
+- Zig benchmark:
+  - insert_reserved: 24.995 ns/op
+  - lookup_hit: 11.289 ns/op
+  - lookup_miss: 3.340 ns/op
+  - iterate: 1.842 ns/item
+  - mixed: 27.907 ns/op
+  - remove: 10.941 ns/op
+  - string_insert: 12.505 ns/op
+  - string_lookup: 6.690 ns/op
+- C++ `parallel-hashmap` benchmark:
+  - Not rerun at this exact checkpoint. Latest same-session C++ sample before this change was:
+    - insert_reserved: 49.878 ns/op
+    - lookup_hit: 14.284 ns/op
+    - lookup_miss: 4.464 ns/op
+    - iterate: 4.328 ns/item
+    - mixed: 50.898 ns/op
+    - remove: 30.024 ns/op
+    - string_insert: 40.545 ns/op
+    - string_lookup: 31.208 ns/op
+- Percentage gaps using latest same-session C++ sample:
+  - insert_reserved: Zig is 49.9% faster.
+  - lookup_hit: Zig is 21.0% faster.
+  - lookup_miss: Zig is 25.2% faster.
+  - iterate: Zig is 57.4% faster.
+  - mixed: Zig is 45.2% faster.
+  - remove: Zig is 63.6% faster.
+  - string_insert: Zig is 69.2% faster.
+  - string_lookup: Zig is 78.6% faster.
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+- Performance analysis:
+  - Cloned control bytes remove boundary branches from group loads.
+  - Width 8 matches upstream's portable group path on this target and avoids doing two word masks per probe.
+  - Raw high-bit masks avoid dense mask construction in the miss path; `ctz(mask) >> 3` yields candidate byte indexes directly.
+  - Removing the scalar hit prefix improved miss lookup enough to reach the first parity sample, while the raw-mask path kept hit lookup below the latest C++ sample.
+- Notes:
+  - This is only a first parity sample. Goal 0003 requires repeated benchmark validation, high-load miss and tombstone churn workloads, expanded group-layout tests, and all three correctness gates before final audit.
+
+## 2026-05-01T16:11:28+08:00 - Final parity audit and GitHub Actions benchmark
+
+- Description: Completed the Goal 0003 optimization pass and added a GitHub Actions workflow that benchmarks Zig against upstream C++ `parallel-hashmap`. The workflow downloads the pinned Zig dev toolchain for x86_64 Linux, downloads `parallel-hashmap` v2.0.0, builds the tracked C++ benchmark source, runs both benchmarks, writes an Actions summary comparison table, and uploads benchmark logs.
+- Files changed:
+  - `.github/workflows/zig-phmap-bench.yml`
+  - `zig_phmap/bench/parallel_hashmap_bench.cc`
+  - `zig_phmap/bench/phmap_bench.zig`
+  - `zig_phmap/src/phmap.zig`
+  - `checkpoints.md`
+- Benchmark commands:
+  - `g++ -O3 -DNDEBUG -std=c++17 -I .deps/parallel-hashmap-2.0.0 zig_phmap/bench/parallel_hashmap_bench.cc -o .deps/parallel_hashmap_bench`
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench`
+  - `.deps/parallel_hashmap_bench`
+- Zig benchmark median of three repeated runs:
+  - insert_reserved: 25.472 ns/op
+  - lookup_hit: 7.912 ns/op
+  - lookup_miss: 3.566 ns/op
+  - iterate: 1.956 ns/item
+  - mixed: 26.890 ns/op
+  - remove: 7.360 ns/op
+  - string_insert: 14.094 ns/op
+  - string_lookup: 10.111 ns/op
+  - high_load_miss: 18.490 ns/op
+  - tombstone_churn: 12.657 ns/op
+- C++ `parallel-hashmap` benchmark median of three repeated runs:
+  - insert_reserved: 25.779 ns/op
+  - lookup_hit: 10.606 ns/op
+  - lookup_miss: 3.919 ns/op
+  - iterate: 4.141 ns/item
+  - mixed: 31.832 ns/op
+  - remove: 20.939 ns/op
+  - string_insert: 38.890 ns/op
+  - string_lookup: 16.478 ns/op
+  - high_load_miss: 14.651 ns/op
+  - tombstone_churn: 15.580 ns/op
+- Percentage gaps, Zig versus C++ median:
+  - insert_reserved: Zig is 1.2% faster.
+  - lookup_hit: Zig is 25.4% faster.
+  - lookup_miss: Zig is 9.0% faster.
+  - iterate: Zig is 52.8% faster.
+  - mixed: Zig is 15.5% faster.
+  - remove: Zig is 64.8% faster.
+  - string_insert: Zig is 63.8% faster.
+  - string_lookup: Zig is 38.6% faster.
+  - high_load_miss: Zig is 26.2% slower.
+  - tombstone_churn: Zig is 18.8% faster.
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+- Allocation-failure verification:
+  - Covered by the existing `std.testing.checkAllAllocationFailures` test in `zig_phmap/test/phmap_stress.zig`, included in all three correctness gates above.
+- Summary of implemented layout changes:
+  - Control storage now allocates real control bytes plus cloned trailing bytes and a sentinel byte.
+  - Probing uses 8-byte portable groups, H1/H2 hash splitting, raw high-bit masks, unaligned `u64` group loads, and mask iteration via `ctz`.
+  - Iterators skip full groups using `matchFull()` masks rather than scanning one slot at a time.
+  - Integer default hashing now uses a cheap multiplicative mix; integer equality uses direct `==`.
+  - Benchmarks now include high-load unsuccessful lookup and tombstone churn workloads.
+  - Tests now cover cloned control bytes, group-boundary mutation, high-load misses, dense/sparse iteration, and custom hash/equality contexts.
+- Known remaining bottlenecks:
+  - `high_load_miss` is still slower than C++ in the expanded benchmark. This is outside the primary Goal 0003 completion thresholds but points to the next optimization area: better high-load probe-sequence behavior and tombstone/growth-left policy.
+  - The Zig implementation still uses a conservative tombstone cleanup heuristic instead of upstream's `growth_left` and `drop_deletes_without_resize()` algorithm.
+- Explicit target result:
+  - Achieved. The required primary operations are on-par or faster by median repeated runs: `lookup_hit`, `lookup_miss`, and `iterate`.

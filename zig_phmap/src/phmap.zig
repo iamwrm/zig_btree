@@ -13,6 +13,8 @@ pub const Config = struct {
 
 const empty: u8 = 0x80;
 const deleted: u8 = 0xfe;
+const sentinel: u8 = 0xff;
+const group_width: usize = 8;
 
 pub fn AutoFlatHashMap(comptime Key: type, comptime Value: type) type {
     return FlatHashMap(Key, Value, void, defaultHash(Key), defaultEql(Key), .{});
@@ -106,7 +108,10 @@ pub fn FlatHashMap(
         }
 
         pub fn clearRetainingCapacity(self: *Self) void {
-            @memset(self.ctrl, empty);
+            if (self.entries.len != 0) {
+                @memset(self.ctrl[0..self.entries.len], empty);
+                self.refreshClones();
+            }
             self.count = 0;
             self.deleted_count = 0;
         }
@@ -178,22 +183,45 @@ pub fn FlatHashMap(
             const fp = fingerprint(h);
             var first_deleted: ?usize = null;
             var index = startIndex(self.entries.len, h);
-            while (true) : (index = nextIndex(self.entries.len, index)) {
-                const c = self.ctrl[index];
-                if (c == empty) {
+            while (true) : (index = nextGroupIndex(self.entries.len, index)) {
+                const first_ctrl = self.ctrl[index];
+                if (first_ctrl == empty) {
                     const target = first_deleted orelse index;
-                    if (first_deleted != null) self.deleted_count -= 1;
-                    self.ctrl[target] = fp;
+                    if (self.ctrl[target] == deleted) self.deleted_count -= 1;
+                    self.setCtrl(target, fp);
                     self.entries[target].key = key;
                     self.count += 1;
                     return .{ .entry = &self.entries[target], .inserted = true };
                 }
-                if (c == deleted) {
+                if (first_ctrl == deleted) {
                     if (first_deleted == null) first_deleted = index;
-                    continue;
-                }
-                if (c == fp and eqlFn(self.context, self.entries[index].key, key)) {
+                } else if (first_ctrl == fp and eqlFn(self.context, self.entries[index].key, key)) {
                     return .{ .entry = &self.entries[index], .inserted = false };
+                }
+
+                const group = Group.load(self.ctrl, index);
+                var matches = group.match(fp) & ~byteMask(0);
+                while (matches != 0) {
+                    const bit = takeLowestByte(&matches);
+                    const candidate = slotAt(self.entries.len, index, bit);
+                    if (eqlFn(self.context, self.entries[candidate].key, key)) {
+                        return .{ .entry = &self.entries[candidate], .inserted = false };
+                    }
+                }
+
+                const deleted_mask = group.matchByte(deleted) & ~byteMask(0);
+                if (first_deleted == null and deleted_mask != 0) {
+                    first_deleted = slotAt(self.entries.len, index, lowestByte(deleted_mask));
+                }
+
+                const empty_mask = group.matchByte(empty) & ~byteMask(0);
+                if (empty_mask != 0) {
+                    const target = first_deleted orelse slotAt(self.entries.len, index, lowestByte(empty_mask));
+                    if (self.ctrl[target] == deleted) self.deleted_count -= 1;
+                    self.setCtrl(target, fp);
+                    self.entries[target].key = key;
+                    self.count += 1;
+                    return .{ .entry = &self.entries[target], .inserted = true };
                 }
             }
         }
@@ -242,40 +270,57 @@ pub fn FlatHashMap(
         pub const Iterator = struct {
             map: *Self,
             index: usize,
+            base: usize = 0,
+            full_mask: u64 = 0,
 
             pub fn next(it: *Iterator) ?*Entry {
-                while (it.index < it.map.entries.len) : (it.index += 1) {
-                    const current = it.index;
-                    if (isFull(it.map.ctrl[current])) {
-                        it.index += 1;
-                        return &it.map.entries[current];
+                while (true) {
+                    if (it.full_mask != 0) {
+                        const bit = takeLowestByte(&it.full_mask);
+                        return &it.map.entries[it.base + bit];
                     }
+                    if (it.index >= it.map.entries.len) return null;
+                    it.base = it.index;
+                    it.full_mask = Group.load(it.map.ctrl, it.index).matchFull();
+                    it.index += group_width;
                 }
-                return null;
             }
         };
 
         pub const ConstIterator = struct {
             map: *const Self,
             index: usize,
+            base: usize = 0,
+            full_mask: u64 = 0,
 
             pub fn next(it: *ConstIterator) ?*const Entry {
-                while (it.index < it.map.entries.len) : (it.index += 1) {
-                    const current = it.index;
-                    if (isFull(it.map.ctrl[current])) {
-                        it.index += 1;
-                        return &it.map.entries[current];
+                while (true) {
+                    if (it.full_mask != 0) {
+                        const bit = takeLowestByte(&it.full_mask);
+                        return &it.map.entries[it.base + bit];
                     }
+                    if (it.index >= it.map.entries.len) return null;
+                    it.base = it.index;
+                    it.full_mask = Group.load(it.map.ctrl, it.index).matchFull();
+                    it.index += group_width;
                 }
-                return null;
             }
         };
 
         pub fn validate(self: *const Self) void {
-            std.debug.assert(self.ctrl.len == self.entries.len);
+            if (self.entries.len == 0) {
+                std.debug.assert(self.ctrl.len == 0);
+                return;
+            }
+            std.debug.assert(self.ctrl.len == self.entries.len + group_width + 1);
+            std.debug.assert(self.ctrl[self.entries.len + group_width] == sentinel);
+            var clone_index: usize = 0;
+            while (clone_index < group_width) : (clone_index += 1) {
+                std.debug.assert(self.ctrl[self.entries.len + clone_index] == self.ctrl[clone_index]);
+            }
             var full_seen: usize = 0;
             var deleted_seen: usize = 0;
-            for (self.ctrl, 0..) |c, i| {
+            for (self.ctrl[0..self.entries.len], 0..) |c, i| {
                 if (isFull(c)) {
                     full_seen += 1;
                     std.debug.assert(self.findIndex(self.entries[i].key) == i);
@@ -303,14 +348,14 @@ pub fn FlatHashMap(
         }
 
         fn capacityFor(items: usize) usize {
-            var table_capacity: usize = @max(@as(usize, 1), config.min_capacity);
+            var table_capacity: usize = @max(@as(usize, group_width), config.min_capacity);
             table_capacity = std.math.ceilPowerOfTwoAssert(usize, table_capacity);
             while (maxLoad(table_capacity) < items) table_capacity *= 2;
             return table_capacity;
         }
 
         fn normalizeCapacity(requested: usize) usize {
-            var table_capacity: usize = @max(@as(usize, 1), config.min_capacity);
+            var table_capacity: usize = @max(@as(usize, group_width), config.min_capacity);
             table_capacity = std.math.ceilPowerOfTwoAssert(usize, table_capacity);
             while (table_capacity < requested) table_capacity *= 2;
             return table_capacity;
@@ -318,11 +363,13 @@ pub fn FlatHashMap(
 
         fn rehash(self: *Self, new_capacity: usize) !void {
             const new_cap = normalizeCapacity(new_capacity);
-            const new_ctrl = try self.allocator.alloc(u8, new_cap);
+            const new_ctrl = try self.allocator.alloc(u8, new_cap + group_width + 1);
             errdefer self.allocator.free(new_ctrl);
             const new_entries = try self.allocator.alloc(Entry, new_cap);
             errdefer self.allocator.free(new_entries);
-            @memset(new_ctrl, empty);
+            @memset(new_ctrl[0..new_cap], empty);
+            @memset(new_ctrl[new_cap .. new_cap + group_width], empty);
+            new_ctrl[new_cap + group_width] = sentinel;
 
             const old_ctrl = self.ctrl;
             const old_entries = self.entries;
@@ -333,7 +380,7 @@ pub fn FlatHashMap(
             self.count = 0;
             self.deleted_count = 0;
 
-            for (old_ctrl, 0..) |c, i| {
+            for (old_ctrl[0..old_entries.len], 0..) |c, i| {
                 if (!isFull(c)) continue;
                 const entry = old_entries[i];
                 const result = self.insertRehashed(entry.key);
@@ -349,32 +396,62 @@ pub fn FlatHashMap(
             const h = hashFn(self.context, key);
             const fp = fingerprint(h);
             var index = startIndex(self.entries.len, h);
-            while (true) : (index = nextIndex(self.entries.len, index)) {
+            while (true) : (index = nextGroupIndex(self.entries.len, index)) {
                 if (self.ctrl[index] == empty) {
-                    self.ctrl[index] = fp;
+                    self.setCtrl(index, fp);
                     self.entries[index].key = key;
                     self.count += 1;
                     return index;
                 }
+
+                const group = Group.load(self.ctrl, index);
+                var mask = group.matchEmptyOrDeleted() & ~byteMask(0);
+                if (mask != 0) {
+                    const target = slotAt(self.entries.len, index, takeLowestByte(&mask));
+                    self.setCtrl(target, fp);
+                    self.entries[target].key = key;
+                    self.count += 1;
+                    return target;
+                }
             }
         }
 
-        fn findIndex(self: *const Self, key: Key) ?usize {
+        inline fn findIndex(self: *const Self, key: Key) ?usize {
             if (self.entries.len == 0) return null;
             const h = hashFn(self.context, key);
             const fp = fingerprint(h);
             var index = startIndex(self.entries.len, h);
-            while (true) : (index = nextIndex(self.entries.len, index)) {
-                const c = self.ctrl[index];
-                if (c == empty) return null;
-                if (c == fp and eqlFn(self.context, self.entries[index].key, key)) return index;
+            while (true) : (index = nextGroupIndex(self.entries.len, index)) {
+                const group = Group.load(self.ctrl, index);
+                if (group.firstByte() == fp) {
+                    if (eqlFn(self.context, self.entries[index].key, key)) return index;
+                }
+                var matches = group.match(fp) & ~byteMask(0);
+                while (matches != 0) {
+                    const bit = takeLowestByte(&matches);
+                    const candidate = slotAt(self.entries.len, index, bit);
+                    if (eqlFn(self.context, self.entries[candidate].key, key)) return candidate;
+                }
+                if (group.matchByte(empty) != 0) return null;
             }
         }
 
         fn eraseIndex(self: *Self, index: usize) void {
-            self.ctrl[index] = deleted;
+            self.setCtrl(index, deleted);
             self.count -= 1;
             self.deleted_count += 1;
+        }
+
+        fn setCtrl(self: *Self, index: usize, value: u8) void {
+            self.ctrl[index] = value;
+            if (index < group_width) {
+                self.ctrl[self.entries.len + index] = value;
+            }
+        }
+
+        fn refreshClones(self: *Self) void {
+            @memcpy(self.ctrl[self.entries.len .. self.entries.len + group_width], self.ctrl[0..group_width]);
+            self.ctrl[self.entries.len + group_width] = sentinel;
         }
     };
 }
@@ -765,35 +842,103 @@ fn undefinedContext(comptime Context: type) Context {
     return undefined;
 }
 
-fn fingerprint(hash: u64) u8 {
+inline fn fingerprint(hash: u64) u8 {
     return @as(u8, @intCast(hash & 0x7f));
 }
 
-fn startIndex(capacity: usize, hash: u64) usize {
-    return @as(usize, @intCast(hash & @as(u64, @intCast(capacity - 1))));
+inline fn startIndex(capacity: usize, hash: u64) usize {
+    return @as(usize, @intCast((hash >> 7) & @as(u64, @intCast(capacity - 1))));
 }
 
-fn nextIndex(capacity: usize, index: usize) usize {
-    return (index + 1) & (capacity - 1);
+inline fn nextGroupIndex(capacity: usize, index: usize) usize {
+    return (index + group_width) & (capacity - 1);
+}
+
+inline fn slotAt(capacity: usize, base: usize, bit: usize) usize {
+    return (base + bit) & (capacity - 1);
 }
 
 fn isFull(c: u8) bool {
     return c < 0x80;
 }
 
+const Group = struct {
+    word: u64,
+
+    inline fn load(ctrl: []const u8, index: usize) Group {
+        const ptr: *align(1) const u64 = @ptrCast(ctrl[index..].ptr);
+        return .{ .word = ptr.* };
+    }
+
+    inline fn match(g: Group, value: u8) u64 {
+        return matchByteWord(g.word, value);
+    }
+
+    inline fn matchByte(g: Group, value: u8) u64 {
+        return g.match(value);
+    }
+
+    fn matchEmptyOrDeleted(g: Group) u64 {
+        return g.word & msbs;
+    }
+
+    fn matchFull(g: Group) u64 {
+        return (~g.matchEmptyOrDeleted()) & msbs;
+    }
+
+    inline fn firstByte(g: Group) u8 {
+        return @truncate(g.word);
+    }
+};
+
+const lsbs: u64 = 0x0101_0101_0101_0101;
+const msbs: u64 = 0x8080_8080_8080_8080;
+
+inline fn matchByteWord(word: u64, value: u8) u64 {
+    const repeated = lsbs * @as(u64, value);
+    const x = word ^ repeated;
+    return (x -% lsbs) & ~x & msbs;
+}
+
+inline fn byteMask(index: usize) u64 {
+    return @as(u64, 0x80) << @intCast(index * 8);
+}
+
+inline fn lowestByte(mask: u64) usize {
+    return @ctz(mask) >> 3;
+}
+
+inline fn takeLowestByte(mask: *u64) usize {
+    const bit = lowestByte(mask.*);
+    mask.* &= mask.* - 1;
+    return bit;
+}
+
 pub fn defaultHash(comptime Key: type) fn (void, Key) u64 {
     return struct {
         fn hash(_: void, key: Key) u64 {
             if (Key == []const u8) return std.hash.Wyhash.hash(0, key);
+            if (Key == u64) return mix64(key);
+            if (Key == usize) return mix64(@intCast(key));
+            if (Key == u32 or Key == u16 or Key == u8) return mix64(@intCast(key));
+            if (Key == i64) return mix64(@bitCast(key));
+            if (Key == isize) return mix64(@bitCast(@as(isize, key)));
+            if (Key == i32 or Key == i16 or Key == i8) return mix64(@bitCast(@as(i64, key)));
             return std.hash.Wyhash.hash(0, std.mem.asBytes(&key));
         }
     }.hash;
+}
+
+fn mix64(value: u64) u64 {
+    return value *% 0x9e37_79b9_7f4a_7c15;
 }
 
 pub fn defaultEql(comptime Key: type) fn (void, Key, Key) bool {
     return struct {
         fn eql(_: void, a: Key, b: Key) bool {
             if (Key == []const u8) return std.mem.eql(u8, a, b);
+            if (Key == u64 or Key == usize or Key == u32 or Key == u16 or Key == u8) return a == b;
+            if (Key == i64 or Key == isize or Key == i32 or Key == i16 or Key == i8) return a == b;
             return std.meta.eql(a, b);
         }
     }.eql;
@@ -834,6 +979,88 @@ test "byte slice keys use content equality" {
     try std.testing.expect((try map.put("alpha", 1)).inserted);
     try std.testing.expect(!(try map.put("alpha", 2)).inserted);
     try std.testing.expectEqual(@as(u64, 2), map.get("alpha").?.*);
+}
+
+test "group clones remain valid across boundary mutations" {
+    var map = AutoFlatHashMap(u64, u64).init(std.testing.allocator);
+    defer map.deinit();
+
+    try map.ensureTotalCapacity(32);
+    var i: u64 = 0;
+    while (i < 64) : (i += 1) {
+        _ = try map.put(i, i * 10);
+    }
+    map.validate();
+
+    i = 0;
+    while (i < 64) : (i += 3) {
+        _ = map.remove(i);
+    }
+    map.validate();
+
+    map.clearRetainingCapacity();
+    map.validate();
+    try std.testing.expectEqual(@as(usize, 0), map.len());
+    try map.ensureTotalCapacity(128);
+    map.validate();
+}
+
+test "high load misses and sparse/dense iteration" {
+    var map = AutoFlatHashMap(u64, u64).init(std.testing.allocator);
+    defer map.deinit();
+
+    try map.ensureTotalCapacity(1800);
+    var i: u64 = 0;
+    while (i < 1800) : (i += 1) {
+        _ = try map.put(i * 17, i);
+    }
+    map.validate();
+
+    i = 0;
+    while (i < 1800) : (i += 1) {
+        try std.testing.expect(map.getConst((i * 17) ^ 0xaaaa_aaaa_aaaa_aaaa) == null);
+    }
+
+    var seen_dense: usize = 0;
+    var it = map.constIterator();
+    while (it.next()) |_| seen_dense += 1;
+    try std.testing.expectEqual(map.len(), seen_dense);
+
+    i = 0;
+    while (i < 1800) : (i += 2) {
+        _ = map.remove(i * 17);
+    }
+    map.validate();
+
+    var seen_sparse: usize = 0;
+    it = map.constIterator();
+    while (it.next()) |_| seen_sparse += 1;
+    try std.testing.expectEqual(map.len(), seen_sparse);
+}
+
+test "custom hash and equality context" {
+    const Context = struct {
+        salt: u64,
+    };
+    const Map = FlatHashMap(u64, u64, Context, struct {
+        fn hash(ctx: Context, key: u64) u64 {
+            return mix64((key / 10) ^ ctx.salt);
+        }
+    }.hash, struct {
+        fn eql(_: Context, a: u64, b: u64) bool {
+            return a / 10 == b / 10;
+        }
+    }.eql, .{});
+
+    var map = Map.initContext(std.testing.allocator, .{ .salt = 0xabc });
+    defer map.deinit();
+
+    try std.testing.expect((try map.put(21, 1)).inserted);
+    try std.testing.expect(!(try map.put(29, 2)).inserted);
+    try std.testing.expectEqual(@as(u64, 2), map.get(20).?.*);
+    try std.testing.expect(map.contains(28));
+    try std.testing.expect(!map.contains(31));
+    map.validate();
 }
 
 test "node map keeps value pointers stable across growth" {
