@@ -168,3 +168,91 @@
   - Rework deletion around a path stack or cursor-aware erase so successful erases avoid duplicate searches while unsuccessful erases remain non-mutating.
 - Stop condition:
   - The low-risk optimization pass improved insert and remove, but Zig is not within ~20% on most operations when compared against the stable Abseil target range from `goal.md`. Further progress requires the larger node-layout and iterator redesign described above.
+
+# Goal 0002: parallel-hashmap Zig Port Checkpoints
+
+## 2026-05-01T10:18:42+08:00 - Initial source inspection
+
+- Description: Started the production Zig port of `parallel-hashmap` v2.0.0. Extracted and inspected the upstream archive, focusing on `README.md` and `parallel_hashmap/phmap.h` before writing Zig code.
+- Files changed:
+  - `checkpoints.md`
+  - `docs/goal_0002_parallel-hashmap.md`
+- Benchmark commands:
+  - Not run yet.
+- Zig benchmark:
+  - Not run yet.
+- C++ `parallel-hashmap` benchmark:
+  - Not run yet.
+- Correctness commands:
+  - Not run yet; no implementation code exists at this checkpoint.
+- Notes:
+  - Upstream provides `flat_hash_map/set`, `node_hash_map/set`, and sharded `parallel_*` variants.
+  - Flat containers use Swiss-table style open addressing with one control byte per slot, 7-bit H2 fingerprints, group probing, capacity as power-of-two-minus-one, deleted-slot tombstones, and a target load factor around 87.5%.
+  - The first implementation target is a portable flat map/set core with control bytes, deterministic tombstone cleanup, allocator awareness, validation, tests, and a benchmark that can be compared against a C++ benchmark using the same workload.
+
+## 2026-05-01T10:26:46+08:00 - First production flat/node implementation and benchmark baseline
+
+- Description: Added an isolated `zig_phmap` package plus root build steps. Implemented `FlatHashMap`, `FlatHashSet`, `NodeHashMap`, and `NodeHashSet` with allocator-aware operation, custom hash/equality contexts, tombstone cleanup, reserve/shrink, iteration, validation, randomized tests, allocation-failure tests, and a comparable C++ benchmark for upstream `parallel-hashmap`.
+- Files changed:
+  - `build.zig`
+  - `zig_phmap/build.zig`
+  - `zig_phmap/README.md`
+  - `zig_phmap/src/phmap.zig`
+  - `zig_phmap/test/phmap_stress.zig`
+  - `zig_phmap/bench/phmap_bench.zig`
+  - `.deps/parallel_hashmap_bench.cc`
+  - `checkpoints.md`
+- Benchmark commands:
+  - `g++ -O3 -DNDEBUG -std=c++17 -I .deps/parallel-hashmap-2.0.0 .deps/parallel_hashmap_bench.cc -o .deps/parallel_hashmap_bench`
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench`
+  - `.deps/parallel_hashmap_bench`
+- Zig benchmark:
+  - insert_reserved: 27.888 ns/op
+  - lookup_hit: 18.292 ns/op
+  - lookup_miss: 17.536 ns/op
+  - iterate: 4.859 ns/item
+  - mixed: 35.774 ns/op
+  - remove: 16.072 ns/op
+  - string_insert: 15.738 ns/op
+  - string_lookup: 13.935 ns/op
+- C++ `parallel-hashmap` benchmark:
+  - insert_reserved: 36.034 ns/op
+  - lookup_hit: 14.229 ns/op
+  - lookup_miss: 3.843 ns/op
+  - iterate: 3.748 ns/item
+  - mixed: 41.503 ns/op
+  - remove: 24.584 ns/op
+  - string_insert: 41.154 ns/op
+  - string_lookup: 21.835 ns/op
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+- Implemented containers and APIs:
+  - `FlatHashMap` / `FlatHashSet`: `init`, `initContext`, `deinit`, `clear`, `clearRetainingCapacity`, `len`, `capacity`, `isEmpty`, `contains`, `get`, `getConst`, `getEntry`, `getEntryConst`, `put`, `insert`, `getOrPut`, `getOrPutValue`, `remove`, `fetchRemove`, `reserve`, `ensureTotalCapacity`, `shrinkAndFree`, forward iteration, custom hash/equality context, and `validate`.
+  - `NodeHashMap` / `NodeHashSet`: same public shape where applicable, with separately allocated nodes so entry/value pointers remain stable across flat-index rehashes.
+- Intentionally missing APIs:
+  - `ParallelFlatHashMap`, `ParallelFlatHashSet`, `ParallelNodeHashMap`, and `ParallelNodeHashSet` are not implemented in this pass.
+  - The planned parallel design is a compile-time shard count, high-hash-bit shard selection, one flat/node container per shard, per-shard locks for writes, unlocked const access only when externally synchronized, and benchmark modes for single-thread and multi-thread insert/lookup.
+  - C++ iterator-erase semantics and heterogeneous lookup are not implemented.
+- Percentage gap, Zig versus C++:
+  - insert_reserved: Zig is 22.6% faster.
+  - lookup_hit: Zig is 28.6% slower.
+  - lookup_miss: Zig is 356.3% slower.
+  - iterate: Zig is 29.6% slower.
+  - mixed: Zig is 13.8% faster.
+  - remove: Zig is 34.6% faster.
+  - string_insert: Zig is 61.8% faster for the benchmark's borrowed byte-slice keys versus C++ `std::string` keys.
+  - string_lookup: Zig is 36.2% faster for the benchmark's borrowed byte-slice keys versus C++ `std::string` keys.
+- Remaining known bottlenecks:
+  - The Zig flat table currently uses scalar linear probing over control bytes. Upstream's fast unsuccessful lookup and iteration rely on group probing with cloned control bytes and SIMD-friendly metadata scans.
+  - `lookup_miss` is the clearest blocker; matching upstream likely requires reworking the control layout to store cloned control bytes, probe in 16-byte groups on this target, and test vectorized equality masks before touching entries.
+  - Iteration still checks every control byte in scalar code. A group mask iterator would skip empty/deleted runs more cheaply.
+  - Node containers duplicate keys in the flat index and the stable node. This is correct and pointer-stable, but not the final memory layout for maximum production efficiency.
+- Proposed next architecture:
+  - Replace scalar probing with a Swiss-table group abstraction: 16-byte groups on aarch64 when vector operations are available, 8-byte portable fallback, cloned tail control bytes, sentinel support, and mask-based full/empty/deleted scans.
+  - Keep a dedicated growth-left counter instead of deriving cleanup from `count` and `deleted_count` alone.
+  - Add sharded containers after group probing is stable, because parallel benchmarks would otherwise measure a known single-shard probe bottleneck.
+  - Add heterogeneous lookup adapters once the core layout is finalized.
+- Stop condition:
+  - The first production pass is correct under the required gates and competitive or faster on insert, mixed, remove, and the borrowed byte-slice benchmark. It is not within the 20% target on hit lookup, miss lookup, or iteration. Further progress requires the group-control/SIMD layout redesign described above, plus a separate sharded-container design pass for the parallel API.
