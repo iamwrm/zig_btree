@@ -18,7 +18,6 @@ const sentinel: u8 = 0xff;
 const vector_group = builtin.cpu.arch == .x86_64;
 const group_width: usize = if (vector_group) 16 else 8;
 const GroupMask = std.meta.Int(.unsigned, group_width * 8);
-const DenseGroupMask = std.meta.Int(.unsigned, group_width);
 
 pub fn AutoFlatHashMap(comptime Key: type, comptime Value: type) type {
     return FlatHashMap(Key, Value, void, defaultHash(Key), defaultEql(Key), .{});
@@ -208,7 +207,7 @@ pub fn FlatHashMap(
         }
 
         inline fn hasInsertionCapacity(self: *const Self) bool {
-            return self.growth_left != 0 and self.deleted_count * 2 < self.entries.len;
+            return self.growth_left != 0;
         }
 
         inline fn findOrInsertIndexAssumeCapacity(self: *Self, key: Key) IndexResult {
@@ -465,7 +464,6 @@ pub fn FlatHashMap(
 
         inline fn findIndex(self: *const Self, key: Key) ?usize {
             if (self.entries.len == 0) return null;
-            if (vector_group) return self.findIndexVector(key);
             const h = hashFn(self.context, key);
             const fp = fingerprint(h);
             var index = startIndex(self.entries.len, h);
@@ -477,22 +475,6 @@ pub fn FlatHashMap(
                 var matches = group.match(fp) & ~byteMask(0);
                 while (matches != 0) {
                     const bit = takeLowestByte(&matches);
-                    const candidate = slotAt(self.entries.len, index, bit);
-                    if (eqlFn(self.context, self.entries[candidate].key, key)) return candidate;
-                }
-                if (group.matchByte(empty) != 0) return null;
-            }
-        }
-
-        inline fn findIndexVector(self: *const Self, key: Key) ?usize {
-            const h = hashFn(self.context, key);
-            const fp = fingerprint(h);
-            var index = startIndex(self.entries.len, h);
-            while (true) : (index = nextGroupIndex(self.entries.len, index)) {
-                const group = VectorGroup.load(self.ctrl, index);
-                var matches = group.match(fp);
-                while (matches != 0) {
-                    const bit = takeLowestDense(&matches);
                     const candidate = slotAt(self.entries.len, index, bit);
                     if (eqlFn(self.context, self.entries[candidate].key, key)) return candidate;
                 }
@@ -928,39 +910,6 @@ fn isFull(c: u8) bool {
 
 const Group = WordGroup;
 
-const VectorGroup = struct {
-    const Bytes = @Vector(group_width, u8);
-
-    bytes: Bytes,
-
-    inline fn load(ctrl: []const u8, index: usize) VectorGroup {
-        const ptr: *align(1) const Bytes = @ptrCast(ctrl[index..].ptr);
-        return .{ .bytes = ptr.* };
-    }
-
-    inline fn match(g: VectorGroup, value: u8) DenseGroupMask {
-        return @bitCast(g.bytes == @as(Bytes, @splat(value)));
-    }
-
-    inline fn matchByte(g: VectorGroup, value: u8) DenseGroupMask {
-        return g.match(value);
-    }
-
-    inline fn matchEmptyOrDeleted(g: VectorGroup) DenseGroupMask {
-        const empty_matches = g.bytes == @as(Bytes, @splat(empty));
-        const deleted_matches = g.bytes == @as(Bytes, @splat(deleted));
-        return @bitCast(empty_matches | deleted_matches);
-    }
-
-    inline fn matchFull(g: VectorGroup) DenseGroupMask {
-        return @bitCast(g.bytes < @as(Bytes, @splat(@as(u8, 0x80))));
-    }
-
-    inline fn firstByte(g: VectorGroup) u8 {
-        return g.bytes[0];
-    }
-};
-
 const WordGroup = struct {
     word: GroupMask,
 
@@ -1009,12 +958,6 @@ inline fn lowestByte(mask: GroupMask) usize {
 
 inline fn takeLowestByte(mask: *GroupMask) usize {
     const bit = lowestByte(mask.*);
-    mask.* &= mask.* - 1;
-    return bit;
-}
-
-inline fn takeLowestDense(mask: *DenseGroupMask) usize {
-    const bit = @ctz(mask.*);
     mask.* &= mask.* - 1;
     return bit;
 }
