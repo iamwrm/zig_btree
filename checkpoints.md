@@ -925,3 +925,46 @@
   - This does not complete Goal 0004 by itself; it makes the required CI evidence less sensitive to noisy single samples.
 - Next optimization hypothesis:
   - Push the workflow update, inspect the median GitHub Actions result, and use that result to decide whether the remaining `insert_reserved` gap is stable enough to require assembly/SSE-level work.
+
+## 2026-05-02T11:14:30+08:00 - Goal 0004 median CI result and x86 no-tombstone experiment
+
+- Description: Inspected GitHub Actions run `25242293675` from commit `c14576689f66d07e354e769e6a6d76e3a28e8d4e6`, then added an x86_64-only no-tombstone fast path for reserved inserts and lookups.
+- Files changed:
+  - `checkpoints.md`
+  - `zig_phmap/src/phmap.zig`
+- GitHub Actions median benchmark from run `25242293675`:
+  - insert_reserved: Zig 29.518 ns/op, C++ 25.782 ns/op, Zig is 14.5% slower.
+  - lookup_hit: Zig 13.300 ns/op, C++ 13.390 ns/op, Zig is 0.7% faster.
+  - lookup_miss: Zig 8.633 ns/op, C++ 4.675 ns/op, Zig is 84.7% slower.
+  - iterate: Zig 2.863 ns/item, C++ 5.394 ns/item, Zig is 46.9% faster.
+  - mixed: Zig 37.135 ns/op, C++ 37.942 ns/op, Zig is 2.1% faster.
+  - remove: Zig 16.615 ns/op, C++ 32.632 ns/op, Zig is 49.1% faster.
+  - string_insert: Zig 24.267 ns/op, C++ 75.700 ns/op, Zig is 67.9% faster.
+  - string_lookup: Zig 17.546 ns/op, C++ 21.695 ns/op, Zig is 19.1% faster.
+  - high_load_miss: Zig 25.111 ns/op, C++ 17.431 ns/op, Zig is 44.1% slower.
+  - tombstone_churn: Zig 17.432 ns/op, C++ 15.992 ns/op, Zig is 9.0% slower.
+- Implementation notes:
+  - Added `findOrInsertIndexNoDeletedAssumeCapacity()` for tables with no tombstones.
+  - Added `findIndexNoDeleted()` for no-tombstone lookups/misses.
+  - The no-tombstone paths use `matchEmptyOrDeleted()` as a cheap empty mask and skip deleted-slot bookkeeping.
+  - Native aarch64 measurement of the unguarded version regressed, so the experiment is gated with `tombstone_free_fast_path = builtin.cpu.arch == .x86_64`.
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig test zig_phmap/src/phmap.zig -target x86_64-linux -O ReleaseFast -fno-emit-bin`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig test -target x86_64-linux -O ReleaseFast --dep phmap -Mroot=zig_phmap/test/phmap_stress.zig -Mphmap=zig_phmap/src/phmap.zig -fno-emit-bin`: pass
+- Local guarded aarch64 median benchmark:
+  - insert_reserved: Zig 25.274 ns/op, C++ 21.751 ns/op, Zig is 16.2% slower.
+  - lookup_hit: Zig 7.502 ns/op, C++ 10.671 ns/op, Zig is 29.7% faster.
+  - lookup_miss: Zig 3.298 ns/op, C++ 3.276 ns/op, Zig is 0.7% slower.
+  - iterate: Zig 1.957 ns/item, C++ 3.825 ns/item, Zig is 48.8% faster.
+  - mixed: Zig 25.632 ns/op, C++ 28.199 ns/op, Zig is 9.1% faster.
+  - remove: Zig 6.935 ns/op, C++ 19.487 ns/op, Zig is 64.4% faster.
+  - string_insert: Zig 12.775 ns/op, C++ 35.973 ns/op, Zig is 64.5% faster.
+  - string_lookup: Zig 9.517 ns/op, C++ 15.229 ns/op, Zig is 37.5% faster.
+  - high_load_miss: Zig 17.542 ns/op, C++ 14.431 ns/op, Zig is 21.6% slower.
+  - tombstone_churn: Zig 13.086 ns/op, C++ 13.160 ns/op, Zig is 0.6% faster.
+- Notes:
+  - The fresh local C++ insert sample was much faster than previous local audits, so local `insert_reserved` parity is not currently demonstrated.
+  - The x86_64-only experiment needs GitHub Actions validation before it can be kept.
+- Next optimization hypothesis:
+  - Push the x86_64 no-tombstone experiment and inspect the median CI result. If it does not improve `insert_reserved` and miss-heavy workloads, remove it and move to generated assembly/SSE movemask work.
