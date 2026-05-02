@@ -991,3 +991,29 @@
   - Keep only the median workflow improvement from this pass.
 - Next optimization hypothesis:
   - Language-level branch restructuring is not enough. The next meaningful path is generated x86_64 assembly inspection and an explicit SSE2/movemask-style group implementation if Zig can expose codegen comparable to C++ `GroupSse2Impl`.
+
+## 2026-05-02T11:21:12+08:00 - Goal 0004 final restored-code median CI audit
+
+- Description: Pushed commit `f0110a484b066573e6bde272a93bb93a9e4761a1`, which removes the rejected no-tombstone experiment while keeping the CI median benchmark workflow, and inspected GitHub Actions run `25242513334`.
+- Files changed:
+  - `checkpoints.md`
+- GitHub Actions median benchmark from run `25242513334`:
+  - insert_reserved: Zig 36.761 ns/op, C++ 28.544 ns/op, Zig is 28.8% slower.
+  - lookup_hit: Zig 17.039 ns/op, C++ 18.262 ns/op, Zig is 6.7% faster.
+  - lookup_miss: Zig 10.940 ns/op, C++ 6.495 ns/op, Zig is 68.4% slower.
+  - iterate: Zig 2.842 ns/item, C++ 5.391 ns/item, Zig is 47.3% faster.
+  - mixed: Zig 47.622 ns/op, C++ 49.502 ns/op, Zig is 3.8% faster.
+  - remove: Zig 18.135 ns/op, C++ 37.325 ns/op, Zig is 51.4% faster.
+  - string_insert: Zig 24.866 ns/op, C++ 88.642 ns/op, Zig is 71.9% faster.
+  - string_lookup: Zig 16.676 ns/op, C++ 23.885 ns/op, Zig is 30.2% faster.
+  - high_load_miss: Zig 31.024 ns/op, C++ 19.072 ns/op, Zig is 62.7% slower.
+  - tombstone_churn: Zig 20.799 ns/op, C++ 22.165 ns/op, Zig is 6.2% faster.
+- Correctness:
+  - GitHub Actions `"${ZIG}" build -Doptimize=ReleaseFast test`: pass.
+  - Local native and x86_64 compile-only correctness commands passed before the removal commit.
+- Final status:
+  - CI benchmark coverage requirement is improved: GitHub Actions now runs Zig and C++ `parallel-hashmap` three times each, uploads raw logs, and reports medians plus sample counts.
+  - Goal 0004 performance objective remains open. Current x86_64 median `insert_reserved` is not on-par with C++, and miss-heavy workloads remain slower.
+- Proposed next architecture:
+  - Inspect generated x86_64 assembly for `Group.load`, `matchByteWord`, `findIndex`, and `findOrInsertIndexAssumeCapacity`.
+  - Prototype a real SSE2 group backend equivalent to C++ `GroupSse2Impl` using compare + movemask semantics, or document the Zig/codegen blocker if that cannot be expressed cleanly.
