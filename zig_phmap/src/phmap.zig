@@ -250,7 +250,7 @@ pub fn FlatHashMap(
                     first_deleted = slotAt(self.entries.len, index, lowestByte(deleted_mask));
                 }
 
-                const empty_mask = group.matchByte(empty) & ~byteMask(0);
+                const empty_mask = group.matchEmpty() & ~byteMask(0);
                 if (empty_mask != 0) {
                     const target = first_deleted orelse slotAt(self.entries.len, index, lowestByte(empty_mask));
                     if (self.ctrl[target] == deleted) {
@@ -478,7 +478,7 @@ pub fn FlatHashMap(
                     const candidate = slotAt(self.entries.len, index, bit);
                     if (eqlFn(self.context, self.entries[candidate].key, key)) return candidate;
                 }
-                if (group.matchByte(empty) != 0) return null;
+                if (group.matchEmpty() != 0) return null;
             }
         }
 
@@ -924,6 +924,10 @@ const WordGroup = struct {
 
     inline fn matchByte(g: WordGroup, value: u8) GroupMask {
         return g.match(value);
+    }
+
+    inline fn matchEmpty(g: WordGroup) GroupMask {
+        return (g.word & (~g.word << 6)) & msbs;
     }
 
     inline fn matchEmptyOrDeleted(g: WordGroup) GroupMask {

@@ -1032,3 +1032,36 @@
   - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig test zig_phmap/src/phmap.zig -target x86_64-linux -O ReleaseFast -fno-emit-bin`: pass
 - Next optimization hypothesis:
   - Focus on portable changes that reduce shared insertion/probe work across all targets, or design a backend abstraction only if every architecture has a correct portable fallback and the public behavior remains architecture-neutral.
+
+## 2026-05-02T11:34:01+08:00 - Goal 0004 portable empty-mask probe change
+
+- Description: Added a portable `WordGroup.matchEmpty()` helper and used it where the probe logic only needs true empty slots. This avoids the general byte-equality expression for empty detection while preserving the shared word-group backend.
+- Files changed:
+  - `checkpoints.md`
+  - `zig_phmap/src/phmap.zig`
+- Implementation notes:
+  - `matchEmpty()` uses `(word & (~word << 6)) & msbs`, matching the portable Swiss-table empty-byte trick.
+  - `findOrInsertIndexAssumeCapacity()` now uses `matchEmpty()` for empty-slot selection.
+  - `findIndex()` now uses `matchEmpty()` for lookup termination.
+  - The change is portable; no x86_64-only SIMD or backend specialization was added.
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig test zig_phmap/src/phmap.zig -target x86_64-linux -O ReleaseFast -fno-emit-bin`: pass
+- Local aarch64 median benchmark:
+  - insert_reserved: Zig 26.158 ns/op, C++ 21.383 ns/op, Zig is 22.3% slower.
+  - lookup_hit: Zig 7.865 ns/op, C++ 10.640 ns/op, Zig is 26.1% faster.
+  - lookup_miss: Zig 3.256 ns/op, C++ 3.202 ns/op, Zig is 1.7% slower.
+  - iterate: Zig 1.820 ns/item, C++ 3.771 ns/item, Zig is 51.7% faster.
+  - mixed: Zig 26.861 ns/op, C++ 29.406 ns/op, Zig is 8.7% faster.
+  - remove: Zig 7.494 ns/op, C++ 19.900 ns/op, Zig is 62.3% faster.
+  - string_insert: Zig 13.046 ns/op, C++ 36.686 ns/op, Zig is 64.4% faster.
+  - string_lookup: Zig 10.353 ns/op, C++ 17.258 ns/op, Zig is 40.0% faster.
+  - high_load_miss: Zig 17.124 ns/op, C++ 14.073 ns/op, Zig is 21.7% slower.
+  - tombstone_churn: Zig 12.323 ns/op, C++ 13.095 ns/op, Zig is 5.9% faster.
+- Notes:
+  - Local `insert_reserved` parity is not demonstrated in this sample.
+  - The change needs GitHub Actions median validation to determine whether x86_64 miss-heavy workloads improve enough to keep it.
+- Next optimization hypothesis:
+  - Push and inspect CI. If the portable empty-mask change does not improve x86_64 median results without worsening `insert_reserved`, revert it and continue with non-architecture-specific probe/insertion changes.
