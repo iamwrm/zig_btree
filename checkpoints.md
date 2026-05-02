@@ -841,3 +841,67 @@
   - The follow-up variants either recovered lookup miss at the cost of insertion, or lost both insertion and miss performance. Restoring the best-observed architecture is preferable to keeping the last experiment.
 - Remaining blocker:
   - Goal 0004 is not complete. Reaching x86_64 `insert_reserved` parity likely requires inspecting generated x86_64 assembly and/or implementing an explicit SSE/movemask group path. The current Zig language-level vector and scalar attempts did not consistently beat C++ on hosted runners.
+
+## 2026-05-02T11:00:44+08:00 - Goal 0004 final audit, not complete
+
+- Description: Pushed commit `4af4e51c82a6320ccd0e9a616651c9ddd8df2dbd` with the restored best-variant guard and inspected GitHub Actions run `25242121866`.
+- Files changed:
+  - `checkpoints.md`
+- Benchmark commands:
+  - GitHub Actions `zig_phmap_bench` run `25242121866`
+  - `"${ZIG}" build -Doptimize=ReleaseFast bench`
+  - `.deps/parallel_hashmap_bench`
+- Zig benchmark from GitHub Actions x86_64:
+  - insert_reserved: 33.811 ns/op
+  - lookup_hit: 14.190 ns/op
+  - lookup_miss: 8.556 ns/op
+  - iterate: 2.842 ns/item
+  - mixed: 37.754 ns/op
+  - remove: 16.062 ns/op
+  - string_insert: 31.630 ns/op
+  - string_lookup: 17.209 ns/op
+  - high_load_miss: 25.541 ns/op
+  - tombstone_churn: 16.961 ns/op
+- C++ `parallel-hashmap` benchmark from GitHub Actions x86_64:
+  - insert_reserved: 25.357 ns/op
+  - lookup_hit: 14.517 ns/op
+  - lookup_miss: 5.714 ns/op
+  - iterate: 5.390 ns/item
+  - mixed: 39.054 ns/op
+  - remove: 31.397 ns/op
+  - string_insert: 73.588 ns/op
+  - string_lookup: 21.590 ns/op
+  - high_load_miss: 21.708 ns/op
+  - tombstone_churn: 17.006 ns/op
+- Percentage gaps, Zig versus C++:
+  - insert_reserved: Zig is 33.3% slower.
+  - lookup_hit: Zig is 2.3% faster.
+  - lookup_miss: Zig is 49.7% slower.
+  - iterate: Zig is 47.3% faster.
+  - mixed: Zig is 3.3% faster.
+  - remove: Zig is 48.8% faster.
+  - string_insert: Zig is 57.0% faster.
+  - string_lookup: Zig is 20.3% faster.
+  - high_load_miss: Zig is 17.7% slower.
+  - tombstone_churn: Zig is 0.3% faster.
+- Correctness commands:
+  - GitHub Actions `"${ZIG}" build -Doptimize=ReleaseFast test`: pass
+  - Local `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - Local `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - Local `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+- Completion audit:
+  - `docs/goal_0004.md` created: complete.
+  - Source inspection of Zig and C++ reserved-insert paths: complete.
+  - Pre-change local benchmark baseline: complete.
+  - First insert hot-path optimization: complete.
+  - Growth-left accounting test coverage: complete.
+  - Local correctness gates: complete.
+  - GitHub Actions Zig-vs-C++ benchmark: complete.
+  - Zig `insert_reserved` <= C++ locally and on GitHub Actions x86_64: not complete.
+  - No >10% secondary regressions: not complete on x86_64 `lookup_miss` / `high_load_miss`.
+- Final status:
+  - Goal 0004 remains open. The best observed CI improvement was run `25241727818`, which reduced `insert_reserved` from 40.122 ns/op to 27.786 ns/op, but it was still 15.3% slower than C++ in that run. Subsequent language-level scalar/vector group attempts did not meet parity.
+- Proposed next architecture:
+  - Inspect generated x86_64 assembly for `getOrPut()` and group matching.
+  - Implement an explicit x86_64 SSE2-style group abstraction with compare + movemask semantics if Zig exposes the required builtin/codegen path cleanly.
+  - Change the CI benchmark workflow to run repeated samples and compare medians, because hosted-runner single samples varied substantially across runs.
