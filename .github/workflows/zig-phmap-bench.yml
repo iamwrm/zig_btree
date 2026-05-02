@@ -12,6 +12,7 @@ jobs:
     env:
       ZIG_VERSION: 0.17.0-dev.135+9df02121d
       ZIG: .toolchains/zig-x86_64-linux-0.17.0-dev.135+9df02121d/zig
+      BENCH_RUNS: 3
 
     steps:
       - name: Checkout
@@ -48,15 +49,28 @@ jobs:
             -o .deps/parallel_hashmap_bench
 
       - name: Run Zig benchmark
-        run: '"${ZIG}" build -Doptimize=ReleaseFast bench 2>&1 | tee zig-phmap-bench.txt'
+        run: |
+          set -o pipefail
+          : > zig-phmap-bench.txt
+          for i in $(seq 1 "${BENCH_RUNS}"); do
+            echo "### Zig run ${i}" | tee -a zig-phmap-bench.txt
+            "${ZIG}" build -Doptimize=ReleaseFast bench 2>&1 | tee -a zig-phmap-bench.txt
+          done
 
       - name: Run C++ parallel-hashmap benchmark
-        run: '.deps/parallel_hashmap_bench | tee cpp-parallel-hashmap-bench.txt'
+        run: |
+          set -o pipefail
+          : > cpp-parallel-hashmap-bench.txt
+          for i in $(seq 1 "${BENCH_RUNS}"); do
+            echo "### C++ parallel-hashmap run ${i}" | tee -a cpp-parallel-hashmap-bench.txt
+            .deps/parallel_hashmap_bench | tee -a cpp-parallel-hashmap-bench.txt
+          done
 
       - name: Compare benchmark output
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          from statistics import median
           import re
 
           def parse(path):
@@ -64,7 +78,7 @@ jobs:
               for line in Path(path).read_text().splitlines():
                   m = re.match(r"([a-z_]+):\s+([0-9.]+) ns/(?:op|item)", line)
                   if m:
-                      out[m.group(1)] = float(m.group(2))
+                      out.setdefault(m.group(1), []).append(float(m.group(2)))
               return out
 
           zig = parse("zig-phmap-bench.txt")
@@ -83,19 +97,23 @@ jobs:
           ]
 
           lines = [
-              "# zig_phmap vs C++ parallel-hashmap",
+              "# zig_phmap vs C++ parallel-hashmap medians",
               "",
-              "| workload | Zig | C++ parallel-hashmap | Zig gap |",
-              "| --- | ---: | ---: | ---: |",
+              f"Each implementation ran {__import__('os').environ['BENCH_RUNS']} benchmark samples. Raw logs are uploaded as artifacts.",
+              "",
+              "| workload | Zig median | C++ parallel-hashmap median | Zig gap | Zig samples | C++ samples |",
+              "| --- | ---: | ---: | ---: | ---: | ---: |",
           ]
           for key in keys:
-              zv = zig.get(key)
-              cv = cpp.get(key)
-              if zv is None or cv is None:
-                  lines.append(f"| `{key}` | missing | missing | n/a |")
+              zsamples = zig.get(key, [])
+              csamples = cpp.get(key, [])
+              if not zsamples or not csamples:
+                  lines.append(f"| `{key}` | missing | missing | n/a | {len(zsamples)} | {len(csamples)} |")
                   continue
+              zv = median(zsamples)
+              cv = median(csamples)
               gap = ((zv / cv) - 1.0) * 100.0
-              lines.append(f"| `{key}` | {zv:.3f} | {cv:.3f} | {gap:+.1f}% |")
+              lines.append(f"| `{key}` | {zv:.3f} | {cv:.3f} | {gap:+.1f}% | {len(zsamples)} | {len(csamples)} |")
 
           summary = "\n".join(lines) + "\n"
           print(summary)

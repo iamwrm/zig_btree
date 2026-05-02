@@ -905,3 +905,23 @@
   - Inspect generated x86_64 assembly for `getOrPut()` and group matching.
   - Implement an explicit x86_64 SSE2-style group abstraction with compare + movemask semantics if Zig exposes the required builtin/codegen path cleanly.
   - Change the CI benchmark workflow to run repeated samples and compare medians, because hosted-runner single samples varied substantially across runs.
+
+## 2026-05-02T11:06:49+08:00 - Goal 0004 CI benchmark median workflow
+
+- Description: Updated the GitHub Actions Zig-vs-C++ benchmark to run repeated samples and compare medians instead of comparing one hosted-runner sample per implementation.
+- Files changed:
+  - `.github/workflows/zig-phmap-bench.yml`
+  - `checkpoints.md`
+- Benchmark workflow changes:
+  - Added `BENCH_RUNS=3`.
+  - Appends all Zig benchmark samples to `zig-phmap-bench.txt`.
+  - Appends all C++ `parallel-hashmap` samples to `cpp-parallel-hashmap-bench.txt`.
+  - Parses every workload occurrence and writes median values, percentage gaps, and sample counts to `benchmark-summary.md` and the GitHub step summary.
+- Local validation commands:
+  - `python3` parser smoke test with three synthetic Zig and C++ samples: pass
+  - `python3` YAML parse of `.github/workflows/zig-phmap-bench.yml`: pass
+- Notes:
+  - No `zig_phmap` implementation code changed in this checkpoint.
+  - This does not complete Goal 0004 by itself; it makes the required CI evidence less sensitive to noisy single samples.
+- Next optimization hypothesis:
+  - Push the workflow update, inspect the median GitHub Actions result, and use that result to decide whether the remaining `insert_reserved` gap is stable enough to require assembly/SSE-level work.
