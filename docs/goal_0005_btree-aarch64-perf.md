@@ -1,44 +1,40 @@
-# Goal 0005: Improve Zig B-tree Performance on aarch64
+# Goal 0005: Improve Zig B-tree Iteration on aarch64
 
-Optimize the Zig `zig_btree` implementation against the C++ Abseil `absl::btree_map` benchmark on the local aarch64 development host.
+Optimize Zig `zig_btree` ordered iteration until it is within 20% of the C++ Abseil `absl::btree_map` benchmark on the local aarch64 development host.
 
 ## Background
 
 The earlier B-tree performance pass improved the Zig implementation but still left substantial local gaps versus Abseil, especially ordered iteration and remove. The current repository also has a root `bench` step for `zig_phmap`, so B-tree performance work must run benchmarks from the `zig_btree/` package directly.
 
-Historical local aarch64 results from the previous B-tree final audit were noisy but showed the remaining problem:
+The current compact-leaf-storage pass materially improved all B-tree workloads, but iteration still misses the parity target:
 
-- Representative Zig sample:
-  - insert: 172.959 ns/op
-  - lookup: 208.325 ns/op
-  - iterate: 12.213 ns/item
-  - remove: 238.366 ns/op
-- Final Abseil sample:
-  - insert: 252.556 ns/op
-  - lookup: 181.305 ns/op
-  - iterate: 6.043 ns/item
-  - remove: 154.198 ns/op
-- Stable Abseil target samples in that run were often lower:
-  - insert: 116-180 ns/op
-  - lookup: 134-191 ns/op
-  - iterate: 4.0-5.1 ns/item
-  - remove: 132-178 ns/op
+- Local aarch64 Zig median after compact leaf storage:
+  - insert: 136.686 ns/op
+  - lookup: 175.685 ns/op
+  - iterate: 7.350 ns/item
+  - remove: 200.519 ns/op
+- Local aarch64 Abseil median from the same audit:
+  - insert: 116.479 ns/op
+  - lookup: 138.838 ns/op
+  - iterate: 3.821 ns/item
+  - remove: 129.703 ns/op
+- Current iteration gap:
+  - Zig is 92.4% slower than Abseil.
+  - The 20% target requires Zig `iterate` <= 4.585 ns/item against that Abseil median.
 
-These numbers are stale and noisy. The first step in this goal is to establish a fresh repeated local aarch64 median baseline.
+These numbers are still noisy. The first step in this goal is to establish a fresh repeated local aarch64 median baseline from the current code before changing iteration internals.
 
 ## Objective
 
-Improve `zig_btree` so its local aarch64 median performance is competitive with C++ Abseil `absl::btree_map` on the same workload.
+Improve `zig_btree` ordered iteration so its local aarch64 median performance is competitive with C++ Abseil `absl::btree_map` on the same workload.
 
-Primary targets:
+Primary target:
 
-- `insert`: Zig should be no slower than 20% over C++ median, or faster.
-- `lookup`: Zig should be no slower than 20% over C++ median, or faster.
-- `remove`: Zig should be no slower than 20% over C++ median, or faster.
-- `iterate`: reduce the gap as much as practical; the target is no slower than 50% over C++ median unless a final checkpoint documents why this requires a larger layout redesign.
+- `iterate`: Zig must be no slower than 20% over C++ Abseil median, or faster, on repeated local aarch64 samples.
 
 Secondary targets:
 
+- Do not regress `insert`, `lookup`, or `remove` by more than 10% from the compact-leaf-storage local median unless the regression is documented and explicitly justified.
 - Preserve all public APIs.
 - Preserve ordered map/set semantics.
 - Preserve cursor and iterator behavior.
@@ -77,6 +73,9 @@ Focus on:
 - parent pointer and child-position maintenance
 - allocation behavior and node initialization
 - invariant validation cost in ReleaseFast
+- whether a leaf-local forward iterator can avoid the generic cursor path
+- whether leftmost/rightmost or leaf successor links can make forward iteration leaf-linear
+- whether internal separator entries force unavoidable parent traversal under the current value-in-all-nodes design
 
 Inspect C++:
 
@@ -91,6 +90,8 @@ Focus on:
 - slot storage and child storage
 - in-node search strategy
 - iterator representation
+- begin/end and increment implementation
+- leftmost/rightmost tracking
 - erase/rebalance strategy
 - allocation count and cache locality
 
@@ -102,14 +103,13 @@ Prefer production architecture improvements over benchmark-only shortcuts.
 
 Likely areas to evaluate:
 
-- Split leaf and internal node representations so leaf nodes do not carry unused child pointer arrays.
-- Consider a manually allocated variable-size node layout if it materially improves cache footprint while keeping ownership clear.
-- Revisit `target_node_size`, `deriveMaxSlots`, and actual node byte size on aarch64.
-- Tune in-node search for local aarch64 using measured thresholds, while keeping correctness and general key support.
+- Add a forward-iteration fast path that stays within a leaf while possible and minimizes parent traversal when a leaf is exhausted.
+- Add leaf predecessor/successor links if they materially reduce iteration overhead and can be maintained safely through split, merge, borrow, root shrink, and clear.
+- Evaluate whether a B+ tree/value-in-leaf design is required to meet the 20% iteration target, and document the migration plan if so.
+- Revisit iterator representation so the common forward iterator does not carry unnecessary cursor functionality.
+- Use cached leftmost/rightmost leaf pointers if they remove repeated descent or simplify begin/end.
 - Reduce iterator overhead by fast-pathing within-node advancement and minimizing parent traversal.
-- Reduce duplicate searches in insert/remove where semantics allow it.
-- Make remove rebalance less pointer-heavy while preserving non-mutating absent-key behavior.
-- Reduce node initialization and child-position maintenance work where safe.
+- Keep insert, remove, split, merge, and borrow maintenance costs bounded when adding iteration metadata.
 - Add targeted inline hints only when the generated code and measurements show a real improvement.
 
 Do not:
@@ -145,6 +145,7 @@ Add or update tests if changes affect:
 - duplicate insert behavior
 - absent-key remove behavior
 - cursor/iterator invalidation
+- forward and reverse iteration after split, merge, borrow, root shrink, and clear
 - lower/upper-bound edge cases
 - leaf/internal node boundaries
 - allocation failure during growth or rebalancing
@@ -174,6 +175,8 @@ Required workloads:
 
 Use at least seven local samples for the pre-change baseline and final audit. Five samples are acceptable for quick experiment rejection if the result is clearly worse.
 
+Primary pass/fail is based on `iterate`. The other workloads are regression guards.
+
 ## Checkpoint Requirements
 
 Update `checkpoints.md` after every meaningful step.
@@ -196,9 +199,10 @@ Required checkpoints:
 
 - source inspection of Zig and Abseil B-tree paths
 - fresh pre-change local aarch64 median baseline
-- first node-layout or hot-path optimization
+- first iteration hot-path optimization
 - first correctness milestone after optimization
-- first benchmark showing a material median improvement
+- first benchmark showing a material `iterate` median improvement
+- first benchmark showing `iterate` within 20% of C++ Abseil, if achieved
 - final audit comparing starting and ending local aarch64 results
 
 ## Completion Criteria
@@ -208,6 +212,7 @@ Produce a final `checkpoints.md` entry summarizing:
 - starting local aarch64 Zig performance
 - ending local aarch64 Zig performance
 - C++ Abseil comparison and percentage gap for each workload
+- explicit `iterate` target calculation and pass/fail status
 - correctness verification
 - allocation-failure verification
 - remaining known bottlenecks
@@ -215,5 +220,5 @@ Produce a final `checkpoints.md` entry summarizing:
 
 Stop only when either:
 
-- Zig is within the primary target thresholds on local aarch64 medians with correctness gates green, or
-- further improvement requires a larger architecture change, and `checkpoints.md` clearly explains the blocker and proposed next design.
+- Zig `iterate` is within 20% of C++ Abseil on local aarch64 medians, `insert`/`lookup`/`remove` regressions are within the documented guardrails, and correctness gates are green, or
+- reaching the 20% `iterate` target requires a larger architecture change, and `checkpoints.md` clearly explains the blocker and proposed next design.
