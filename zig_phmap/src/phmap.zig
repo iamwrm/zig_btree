@@ -207,7 +207,7 @@ pub fn FlatHashMap(
         }
 
         inline fn hasInsertionCapacity(self: *const Self) bool {
-            return self.growth_left != 0;
+            return self.growth_left != 0 and self.deleted_count * 2 < self.entries.len;
         }
 
         inline fn findOrInsertIndexAssumeCapacity(self: *Self, key: Key) IndexResult {
