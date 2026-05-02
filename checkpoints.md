@@ -1065,3 +1065,26 @@
   - The change needs GitHub Actions median validation to determine whether x86_64 miss-heavy workloads improve enough to keep it.
 - Next optimization hypothesis:
   - Push and inspect CI. If the portable empty-mask change does not improve x86_64 median results without worsening `insert_reserved`, revert it and continue with non-architecture-specific probe/insertion changes.
+
+## 2026-05-02T11:37:39+08:00 - Goal 0004 portable empty-mask CI result
+
+- Description: Pushed commit `e034d42b08c8f03f4442bd9ed7cc6e6820fed0e4` and inspected GitHub Actions run `25242834962`.
+- Files changed:
+  - `checkpoints.md`
+- GitHub Actions median benchmark from run `25242834962`:
+  - insert_reserved: Zig 29.842 ns/op, C++ 26.363 ns/op, Zig is 13.2% slower.
+  - lookup_hit: Zig 13.659 ns/op, C++ 15.749 ns/op, Zig is 13.3% faster.
+  - lookup_miss: Zig 9.208 ns/op, C++ 5.343 ns/op, Zig is 72.3% slower.
+  - iterate: Zig 2.895 ns/item, C++ 5.410 ns/item, Zig is 46.5% faster.
+  - mixed: Zig 39.298 ns/op, C++ 37.291 ns/op, Zig is 5.4% slower.
+  - remove: Zig 16.235 ns/op, C++ 31.822 ns/op, Zig is 49.0% faster.
+  - string_insert: Zig 24.367 ns/op, C++ 76.256 ns/op, Zig is 68.0% faster.
+  - string_lookup: Zig 16.731 ns/op, C++ 21.975 ns/op, Zig is 23.9% faster.
+  - high_load_miss: Zig 25.785 ns/op, C++ 18.006 ns/op, Zig is 43.2% slower.
+  - tombstone_churn: Zig 17.589 ns/op, C++ 16.416 ns/op, Zig is 7.1% slower.
+- Correctness:
+  - GitHub Actions `"${ZIG}" build -Doptimize=ReleaseFast test`: pass.
+- Decision:
+  - Keep the portable `matchEmpty()` change. It does not complete the goal, but it improves the median x86_64 `insert_reserved` gap compared with the restored-code median run and keeps the implementation portable.
+- Next optimization hypothesis:
+  - Continue with portable insertion fast-path branch reduction, especially avoiding deleted-slot checks when the selected insertion target is known to be empty.
