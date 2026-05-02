@@ -78,6 +78,39 @@ test "reserve shrink and tombstone churn" {
     map.validate();
 }
 
+test "reserved insertion preserves growth accounting through tombstone reuse" {
+    var map = phmap.AutoFlatHashMap(u64, u64).init(std.testing.allocator);
+    defer map.deinit();
+
+    try map.ensureTotalCapacity(2048);
+    const reserved_capacity = map.capacity();
+
+    var i: usize = 0;
+    while (i < 2048) : (i += 1) {
+        _ = try map.put(@intCast(i * 17), @intCast(i));
+    }
+    try std.testing.expectEqual(reserved_capacity, map.capacity());
+    map.validate();
+
+    i = 0;
+    while (i < 2048) : (i += 3) {
+        try std.testing.expect(map.remove(@intCast(i * 17)));
+    }
+    map.validate();
+
+    i = 0;
+    while (i < 2048) : (i += 3) {
+        _ = try map.put(@intCast(1_000_000 + i), @intCast(i + 1));
+    }
+    try std.testing.expectEqual(@as(usize, 2048), map.len());
+    map.validate();
+
+    map.clearRetainingCapacity();
+    try std.testing.expectEqual(reserved_capacity, map.capacity());
+    try std.testing.expectEqual(@as(usize, 0), map.len());
+    map.validate();
+}
+
 test "allocation failure coverage" {
     const Map = phmap.AutoFlatHashMap(u64, u64);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {

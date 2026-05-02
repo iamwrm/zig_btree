@@ -438,3 +438,142 @@
   - The Zig implementation still uses a conservative tombstone cleanup heuristic instead of upstream's `growth_left` and `drop_deletes_without_resize()` algorithm.
 - Explicit target result:
   - Achieved. The required primary operations are on-par or faster by median repeated runs: `lookup_hit`, `lookup_miss`, and `iterate`.
+
+## 2026-05-02T10:15:30+08:00 - Goal 0004 source inspection and completion audit
+
+- Description: Started Goal 0004, which targets the Zig `insert_reserved` regression seen on GitHub Actions x86_64. Audited the current state against `docs/goal_0004.md`: the goal prompt exists, but no Goal 0004 implementation or final checkpoint exists yet, so the objective is not complete.
+- Files changed:
+  - `checkpoints.md`
+  - `docs/goal_0004.md`
+- Source inspection:
+  - Zig reserved insert is measured by `zig_phmap/bench/phmap_bench.zig` as `ensureTotalCapacity(n)` followed by one million `map.put(key, value)` calls.
+  - Zig `put()` calls `getOrPut()`, which always runs `ensureAdditionalCapacity(1)` before hashing and probing. In the reserved benchmark this guard is expected to be a fast return, but it still remains on the hot path.
+  - Zig `getOrPut()` combines duplicate lookup and insertion-target selection in one loop. It checks the first control byte separately, then loads the full group, scans H2 matches, remembers the first deleted slot, and inserts at the first empty slot.
+  - Zig currently tracks `count` and `deleted_count`, not upstream-style `growth_left`. Reserved insertion therefore pays the general tombstone cleanup heuristic in `ensureAdditionalCapacity`.
+  - Zig probing advances linearly by one group with `nextGroupIndex(capacity, index) = (index + group_width) & (capacity - 1)`.
+  - Upstream `parallel_hashmap/phmap.h` uses `_find_key()` to perform duplicate lookup, then `prepare_insert()` to find/prepare the insertion slot. `prepare_insert()` uses `find_first_non_full()`, `growth_left`, and `drop_deletes_without_resize()`/growth policy.
+  - Upstream probe sequence uses triangular group advancement: `index_ += Group::kWidth`, `offset_ += index_`, masked by capacity. Zig's linear group advancement differs and may increase clustering or produce different x86_64 behavior.
+  - Upstream portable `Group::MatchEmptyOrDeleted()` uses `(ctrl & (~ctrl << 7)) & msbs`, which matches empty/deleted but not the sentinel. Zig `matchEmptyOrDeleted()` currently returns `word & msbs`, which also marks the sentinel byte as non-full; this is harmless only because cloned bytes normally allow a real empty before the sentinel, but it is less precise than upstream.
+  - Upstream `set_ctrl()` updates both the primary control byte and cloned byte with a branchless derived index. Zig `setCtrl()` only updates the cloned byte when `index < group_width`.
+- Benchmark commands:
+  - Not run yet for this inspection checkpoint.
+- Correctness commands:
+  - Not run yet for this inspection checkpoint.
+- Next optimization hypothesis:
+  - First measure a fresh local baseline, then evaluate insert-specific hot-path reductions: a reserved/no-grow insertion helper, more upstream-like probe advancement, and a precise empty-or-deleted mask that does not treat sentinel as reusable.
+
+## 2026-05-02T10:18:05+08:00 - Goal 0004 pre-change local baseline
+
+- Description: Rebuilt the tracked C++ benchmark and ran three local aarch64 benchmark samples for the current Zig and C++ implementations before changing code.
+- Files changed:
+  - `checkpoints.md`
+- Benchmark commands:
+  - `g++ -O3 -DNDEBUG -std=c++17 -I .deps/parallel-hashmap-2.0.0 zig_phmap/bench/parallel_hashmap_bench.cc -o .deps/parallel_hashmap_bench`
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench` repeated three times
+  - `.deps/parallel_hashmap_bench` repeated three times
+- Zig benchmark median of three repeated runs:
+  - insert_reserved: 28.061 ns/op
+  - lookup_hit: 8.700 ns/op
+  - lookup_miss: 3.700 ns/op
+  - iterate: 1.865 ns/item
+  - mixed: 29.950 ns/op
+  - remove: 7.383 ns/op
+  - string_insert: 14.144 ns/op
+  - string_lookup: 10.383 ns/op
+  - high_load_miss: 19.113 ns/op
+  - tombstone_churn: 15.619 ns/op
+- C++ `parallel-hashmap` benchmark median of three repeated runs:
+  - insert_reserved: 28.393 ns/op
+  - lookup_hit: 11.901 ns/op
+  - lookup_miss: 3.669 ns/op
+  - iterate: 3.793 ns/item
+  - mixed: 32.888 ns/op
+  - remove: 20.544 ns/op
+  - string_insert: 33.346 ns/op
+  - string_lookup: 15.623 ns/op
+  - high_load_miss: 14.429 ns/op
+  - tombstone_churn: 15.546 ns/op
+- Percentage gaps, Zig versus C++ median:
+  - insert_reserved: Zig is 1.2% faster.
+  - lookup_hit: Zig is 26.9% faster.
+  - lookup_miss: Zig is 0.8% slower.
+  - iterate: Zig is 50.8% faster.
+  - mixed: Zig is 8.9% faster.
+  - remove: Zig is 64.1% faster.
+  - string_insert: Zig is 57.6% faster.
+  - string_lookup: Zig is 33.5% faster.
+  - high_load_miss: Zig is 32.5% slower.
+  - tombstone_churn: Zig is 0.5% slower.
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+- Notes:
+  - Local aarch64 `insert_reserved` remains at parity, so the completion blocker is specifically the GitHub Actions x86_64 result from run `25212031553`.
+  - The benchmark is noisy on this host, especially the first C++ sample, so use medians for local decisions.
+- Next optimization hypothesis:
+  - Reduce general insertion overhead without hurting local parity by introducing an insert path that separates the no-grow reserved fast path from rehash/tombstone cleanup decisions, then validate on CI x86_64.
+
+## 2026-05-02T10:35:28+08:00 - Goal 0004 first insert hot-path optimization
+
+- Description: Added upstream-style growth-capacity accounting and a no-grow insertion fast path, made integer default hashing match C++ `std::hash` identity behavior, and made the group mask width target-aware so x86_64 uses 16-byte groups while aarch64 keeps the 8-byte portable group width that protects local miss-lookup performance.
+- Files changed:
+  - `zig_phmap/src/phmap.zig`
+  - `zig_phmap/test/phmap_stress.zig`
+  - `checkpoints.md`
+- Implementation notes:
+  - Added `growth_left` to avoid recomputing `maxLoad(capacity)` on every reserved insert.
+  - Added invariant validation for `growth_left == maxLoad(capacity) - count - deleted_count`.
+  - Added `hasInsertionCapacity()` and `findOrInsertIndexAssumeCapacity()` so reserved inserts can bypass the allocator-capable capacity path.
+  - Changed integer default hashing to identity, matching the upstream C++ benchmark's effective `std::hash<uint64_t>` behavior and avoiding an extra multiply in every integer insert/lookup.
+  - Generalized group masks to `GroupMask`, using 16-byte groups on x86_64 and 8-byte groups elsewhere.
+  - Tested universal 16-byte groups locally, but rejected that variant because it improved insertion while regressing local `lookup_miss` well beyond the allowed 10% secondary budget.
+  - Tested a duplicated direct `put` hot path that stored key and value in one loop, but rejected that variant because it did not improve the median and added unnecessary code duplication.
+- Benchmark commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench` repeated three times
+  - `.deps/parallel_hashmap_bench` repeated three times
+- Zig benchmark median of three repeated runs from the retained target-aware implementation:
+  - insert_reserved: 25.892 ns/op
+  - lookup_hit: 7.531 ns/op
+  - lookup_miss: 3.604 ns/op
+  - iterate: 1.961 ns/item
+  - mixed: 26.898 ns/op
+  - remove: 7.182 ns/op
+  - string_insert: 12.881 ns/op
+  - string_lookup: 10.539 ns/op
+  - high_load_miss: 17.740 ns/op
+  - tombstone_churn: 12.174 ns/op
+- C++ `parallel-hashmap` benchmark median of three repeated runs from the latest local sample:
+  - insert_reserved: 22.032 ns/op
+  - lookup_hit: 12.294 ns/op
+  - lookup_miss: 4.469 ns/op
+  - iterate: 4.002 ns/item
+  - mixed: 29.607 ns/op
+  - remove: 20.816 ns/op
+  - string_insert: 33.092 ns/op
+  - string_lookup: 14.345 ns/op
+  - high_load_miss: 14.673 ns/op
+  - tombstone_churn: 16.843 ns/op
+- Percentage gaps, Zig versus latest C++ median:
+  - insert_reserved: Zig is 17.5% slower.
+  - lookup_hit: Zig is 38.7% faster.
+  - lookup_miss: Zig is 19.4% faster.
+  - iterate: Zig is 51.0% faster.
+  - mixed: Zig is 9.1% faster.
+  - remove: Zig is 65.5% faster.
+  - string_insert: Zig is 61.1% faster.
+  - string_lookup: Zig is 26.5% faster.
+  - high_load_miss: Zig is 20.9% slower.
+  - tombstone_churn: Zig is 27.7% faster.
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig test zig_phmap/src/phmap.zig -target x86_64-linux -O ReleaseFast -fno-emit-bin`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig test -target x86_64-linux -O ReleaseFast --dep phmap -Mroot=zig_phmap/test/phmap_stress.zig -Mphmap=zig_phmap/src/phmap.zig -fno-emit-bin`: pass
+- Notes:
+  - Local aarch64 `insert_reserved` improved versus the Goal 0004 pre-change Zig median, from 28.061 ns/op to 25.892 ns/op.
+  - Local C++ samples varied substantially during this pass, with medians ranging from 28.393 ns/op in the pre-change baseline to 22.032 ns/op in the latest sample, so local parity remains noisy and not conclusively achieved against the fastest local C++ sample.
+  - The main intended improvement for the original CI failure is the x86_64 16-byte group path, which can only be measured by the GitHub Actions benchmark.
+- Next optimization hypothesis:
+  - Commit and push this implementation to get the required GitHub Actions x86_64 benchmark. If CI still shows `insert_reserved` slower than C++, inspect x86_64 codegen for 16-byte group loads/masks and consider an explicit vector implementation instead of `u128` scalar masks.
