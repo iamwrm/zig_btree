@@ -1119,3 +1119,24 @@
   - The local C++ samples were noisy in this run, so CI median validation is required before treating this as meaningful parity evidence.
 - Next optimization hypothesis:
   - Push and inspect CI. Keep the change only if the x86_64 median benchmark does not regress the primary `insert_reserved` result.
+
+## 2026-05-02T19:14:48+08:00 - Goal 0004 scope narrowed to local aarch64
+
+- Description: Updated `docs/goal_0004.md` to remove GitHub Actions benchmark performance as a pass/fail gate and focus Goal 0004 on local development-host aarch64 benchmark medians.
+- Files changed:
+  - `docs/goal_0004.md`
+  - `checkpoints.md`
+- Goal changes:
+  - Required final threshold is now local-only: Zig `insert_reserved` must be no slower than C++ `parallel-hashmap` on local benchmark medians.
+  - GitHub Actions benchmark output is context/visibility only and must not be used to accept, reject, or complete Goal 0004.
+  - Completion audit now compares starting and ending local aarch64 results only.
+  - Portability remains a secondary target: do not add target-only micro-optimizations.
+- Correctness commands:
+  - Not rerun for this checkpoint; documentation-only change.
+- Benchmark commands:
+  - Not rerun for this checkpoint; documentation-only change.
+- Notes:
+  - This supersedes earlier checkpoints that treated hosted x86_64 results as a completion blocker.
+  - Future iterations should use local repeated samples and medians to keep the loop fast.
+- Next optimization hypothesis:
+  - Continue local aarch64 iteration on portable insertion-path changes and use CI only as a repository health signal.
