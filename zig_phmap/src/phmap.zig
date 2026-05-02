@@ -164,7 +164,7 @@ pub fn FlatHashMap(
             return &self.entries[index];
         }
 
-        pub fn insert(self: *Self, key: Key, value: Value) !InsertResult {
+        pub inline fn insert(self: *Self, key: Key, value: Value) !InsertResult {
             const result = try self.getOrPut(key);
             if (result.inserted) {
                 result.entry.value = value;
@@ -172,7 +172,7 @@ pub fn FlatHashMap(
             return result;
         }
 
-        pub fn put(self: *Self, key: Key, value: Value) !PutResult {
+        pub inline fn put(self: *Self, key: Key, value: Value) !PutResult {
             const result = if (self.hasInsertionCapacity())
                 self.findOrInsertIndexAssumeCapacity(key)
             else
@@ -187,13 +187,13 @@ pub fn FlatHashMap(
             return .{ .entry = entry, .inserted = false, .old_value = old };
         }
 
-        pub fn getOrPutValue(self: *Self, key: Key, value: Value) !InsertResult {
+        pub inline fn getOrPutValue(self: *Self, key: Key, value: Value) !InsertResult {
             const result = try self.getOrPut(key);
             if (result.inserted) result.entry.value = value;
             return result;
         }
 
-        pub fn getOrPut(self: *Self, key: Key) !InsertResult {
+        pub inline fn getOrPut(self: *Self, key: Key) !InsertResult {
             const result = if (self.hasInsertionCapacity())
                 self.findOrInsertIndexAssumeCapacity(key)
             else
