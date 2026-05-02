@@ -1246,3 +1246,127 @@
   - The remaining known bottleneck is `high_load_miss`, where Zig remains 4.0% slower than this local C++ median and had also been slower in prior audits. It is outside the primary Goal 0004 target but remains the next portable probe-sequence optimization area.
 - Stop condition:
   - Goal 0004 local aarch64 `insert_reserved` parity is met with repeated local medians and all required correctness gates green.
+
+# Goal 0005: B-tree aarch64 Performance Checkpoints
+
+## 2026-05-02T20:13:06+08:00 - Goal 0005 source inspection
+
+- Description: Started the local aarch64 B-tree performance pass from `docs/goal_0005_btree-aarch64-perf.md` by inspecting the Zig B-tree implementation, stress tests, benchmark, and Abseil comparison sources before changing code.
+- Files changed:
+  - `docs/goal_0005_btree-aarch64-perf.md`
+  - `checkpoints.md`
+- Zig source-inspection notes:
+  - `zig_btree/src/btree.zig` uses one fixed `Node` shape for both leaves and internals: parent pointer, position, length, leaf flag, `[max_slots]Entry`, and `[max_slots + 1]?*Node` children.
+  - `deriveMaxSlots()` already derives fanout from leaf payload size, but actual leaf allocations still pay for the full child pointer array. For the benchmark `u64 -> u64` map with `target_node_size = 256`, this likely creates a much larger physical node than the target leaf payload implies.
+  - Insert is top-down: full root is split before descent, full children are split before descent, and duplicate handling performs an extra full-tree lookup before splitting a full root or child.
+  - Lookup uses `lowerBoundInNode()` at each node, followed by a separate equality comparison. With the current default `linear_search_threshold = 16`, the benchmark configuration likely uses binary search inside nodes.
+  - Iteration wraps a cursor that checks generation in Debug/ReleaseSafe and then advances through leaf nodes by parent traversal when a leaf is exhausted. ReleaseFast removes the generation check but still pays the cursor shape and parent/position traversal.
+  - Remove uses top-down deletion and preserves absent-key non-mutating semantics by calling `containsInSubtree()` before rebalancing a minimum-size child. That avoids mutation on misses but can duplicate search work.
+  - Allocation-failure coverage exists through `std.testing.checkAllAllocationFailures` in `zig_btree/src/btree.zig`; randomized model coverage exists in `zig_btree/test/btree_stress.zig`.
+- Abseil source-inspection notes:
+  - `.deps/abseil/absl/container/internal/btree.h` uses layout helpers for distinct leaf and internal allocations: leaves allocate slots only, while internals allocate slots plus child pointers.
+  - Abseil leaf node capacity is derived from the target node size and actual layout size. Internal nodes use a sentinel max-count representation and include child storage.
+  - Abseil insertion uses iterator-based locating, then `rebalance_or_split()` which first tries sibling rebalancing before splitting.
+  - Abseil tracks leftmost/rightmost leaf nodes and has iterator machinery designed around node/position traversal with compact node metadata.
+  - Abseil erase can merge or rebalance around an iterator and has specialized leaf erase behavior for bulk erase paths.
+- Benchmark notes:
+  - The B-tree Zig benchmark must be run from `zig_btree/`; the repo-root `bench` step currently runs the phmap benchmark.
+  - The C++ comparison binary is `.deps/abseil_btree_bench`, backed by `.deps/abseil_btree_bench.cc`.
+- Correctness commands:
+  - Not run for this inspection-only checkpoint.
+- Benchmark commands:
+  - Not run for this inspection-only checkpoint.
+- Next optimization hypothesis:
+  - Establish fresh local aarch64 medians first. If the old pattern still holds, the highest-leverage production change is compact leaf/internal node layout; quicker low-risk experiments are inline wrapper/search changes and iterator fast paths.
+
+## 2026-05-02T20:14:32+08:00 - Goal 0005 fresh local aarch64 baseline
+
+- Description: Ran the required fresh repeated local baseline for Zig B-tree versus C++ Abseil before making code changes.
+- Files changed:
+  - `docs/goal_0005_btree-aarch64-perf.md`
+  - `checkpoints.md`
+- Benchmark commands:
+  - `cd /home/wr/gh/zig_tree/zig_btree && /home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench` repeated seven times
+  - `cd /home/wr/gh/zig_tree && .deps/abseil_btree_bench` repeated seven times
+- Local aarch64 7-sample median Zig benchmark:
+  - insert: 199.109 ns/op
+  - lookup: 219.507 ns/op
+  - iterate: 12.918 ns/item
+  - remove: 240.232 ns/op
+- Local aarch64 7-sample median C++ Abseil benchmark:
+  - insert: 110.298 ns/op
+  - lookup: 124.161 ns/op
+  - iterate: 3.603 ns/item
+  - remove: 124.807 ns/op
+- Percentage gaps, Zig versus C++ median:
+  - insert: Zig is 80.5% slower.
+  - lookup: Zig is 76.8% slower.
+  - iterate: Zig is 258.5% slower.
+  - remove: Zig is 92.5% slower.
+- Correctness commands:
+  - Not run for this benchmark-only baseline checkpoint.
+- Notes:
+  - The primary target thresholds are not met.
+  - The largest gap is iteration, consistent with the fixed node shape and cursor traversal concerns from source inspection.
+  - Insert and remove gaps are large enough that leaf/internal layout and split/rebalance strategy remain likely larger follow-up areas.
+- Next optimization hypothesis:
+  - Start with low-risk call-shape and iterator/search changes that preserve layout. If those do not move medians materially, implement the larger compact leaf/internal node layout.
+
+## 2026-05-02T20:36:56+08:00 - Goal 0005 compact leaf storage and final audit
+
+- Description: Changed the Zig B-tree node layout so leaf nodes no longer embed the full child pointer array. Internal nodes now allocate child storage separately. Also narrowed duplicate-insert prechecks before child splits to search only the full child subtree instead of restarting from the root.
+- Files changed:
+  - `docs/goal_0005_btree-aarch64-perf.md`
+  - `zig_btree/src/btree.zig`
+  - `checkpoints.md`
+- Implementation notes:
+  - `Node.children` changed from an embedded `[max_slots + 1]?*Node` array to `?*[max_slots + 1]?*Node`.
+  - `newNode()` allocates child storage only for internal nodes; leaf nodes keep `children = null`.
+  - `destroyNode()` now frees child storage when present.
+  - Split, merge, borrow, root growth/shrink, child shifting, validation, and traversal now dereference child storage only for internal nodes.
+  - `stats().bytes_used` now includes separately allocated internal child arrays.
+  - The duplicate precheck before splitting a full child now uses `findEntryInSubtree(child, key)` instead of `getEntry(key)` from the root. This preserves non-mutating duplicate-insert behavior while avoiding redundant traversal above the full child.
+- Rejected experiments:
+  - Inlining delete/rebalance helpers failed ReleaseFast compilation because inlined constant-zero callers exposed a comptime `idx - 1` underflow path in `fillChild()`.
+  - Inlining only root growth and child split compiled but worsened quick medians, so it was reverted.
+  - A direct lookup path that bypassed cursor construction compiled but repeatedly worsened lookup medians, so it was reverted.
+  - Forcing binary in-node search with `.linear_search_threshold = 0` was substantially slower on local aarch64, so the benchmark config was reverted.
+  - Retuning the benchmark node target size to 320 or 192 bytes was slower than the existing 256-byte target, so the benchmark config was reverted.
+- Benchmark commands:
+  - `cd /home/wr/gh/zig_tree/zig_btree && /home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench` repeated seven times
+  - `cd /home/wr/gh/zig_tree && .deps/abseil_btree_bench` repeated seven times
+- Local aarch64 7-sample median Zig benchmark:
+  - insert: 136.686 ns/op
+  - lookup: 175.685 ns/op
+  - iterate: 7.350 ns/item
+  - remove: 200.519 ns/op
+- Local aarch64 7-sample median C++ Abseil benchmark:
+  - insert: 116.479 ns/op
+  - lookup: 138.838 ns/op
+  - iterate: 3.821 ns/item
+  - remove: 129.703 ns/op
+- Percentage gaps, Zig versus C++ median:
+  - insert: Zig is 17.3% slower.
+  - lookup: Zig is 26.5% slower.
+  - iterate: Zig is 92.4% slower.
+  - remove: Zig is 54.6% slower.
+- Improvement versus Goal 0005 starting Zig median:
+  - insert: 31.3% faster, from 199.109 to 136.686 ns/op.
+  - lookup: 20.0% faster, from 219.507 to 175.685 ns/op.
+  - iterate: 43.1% faster, from 12.918 to 7.350 ns/item.
+  - remove: 16.5% faster, from 240.232 to 200.519 ns/op.
+- Correctness commands:
+  - `cd /home/wr/gh/zig_tree/zig_btree && /home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `cd /home/wr/gh/zig_tree/zig_btree && /home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `cd /home/wr/gh/zig_tree/zig_btree && /home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+- Allocation-failure verification:
+  - Covered by `std.testing.checkAllAllocationFailures` in `zig_btree/src/btree.zig`, included in all three correctness gates above.
+- Architecture-specific work:
+  - None. The retained implementation is portable and does not add aarch64-only code.
+- Final audit:
+  - `insert` now meets the Goal 0005 primary threshold: Zig is within 20% of C++ locally.
+  - `lookup`, `iterate`, and `remove` are improved but still miss the target thresholds.
+  - The remaining gap is not from a small local threshold or wrapper issue based on rejected experiments. Further progress likely requires a larger architecture change: either an Abseil-style manually allocated node layout with compact metadata and integrated iterator state, or a B+ tree/value-in-leaf design that makes iteration leaf-linear instead of repeatedly traversing parent links and internal separator entries.
+  - Remove likely needs an Abseil-style iterator erase/rebalance path to avoid the current top-down delete structure and absent-key-preserving subtree checks on hot present-key removals.
+- Stop condition:
+  - The low-risk and medium-size layout pass delivered material local aarch64 improvements, but full Goal 0005 parity for lookup/iterate/remove requires the larger architecture changes above.

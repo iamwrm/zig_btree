@@ -77,7 +77,7 @@ pub fn BTreeMap(
             len: u16,
             leaf: bool,
             entries: [max_slots]Entry,
-            children: [max_slots + 1]?*Node,
+            children: ?*[max_slots + 1]?*Node,
 
             fn init(leaf: bool, parent: ?*Node, position: usize) Node {
                 return .{
@@ -86,7 +86,7 @@ pub fn BTreeMap(
                     .len = 0,
                     .leaf = leaf,
                     .entries = undefined,
-                    .children = [_]?*Node{null} ** (max_slots + 1),
+                    .children = null,
                 };
             }
 
@@ -381,7 +381,7 @@ pub fn BTreeMap(
                 }
                 var child = childAt(n, i);
                 if (child.count() == max_slots) {
-                    if (self.getEntry(entry_.key)) |existing| {
+                    if (self.findEntryInSubtree(child, &entry_.key)) |existing| {
                         return .{ .entry = existing, .inserted = false };
                     }
                     try self.splitChild(n, i);
@@ -596,7 +596,7 @@ pub fn BTreeMap(
                 .max_node_slots = max_slots,
                 .min_node_slots = min_slots,
                 .fullness = if (cap == 0) 0 else @as(f64, @floatFromInt(self.len_)) / @as(f64, @floatFromInt(cap)),
-                .bytes_used = @sizeOf(Self) + node_count * @sizeOf(Node),
+                .bytes_used = @sizeOf(Self) + node_count * @sizeOf(Node) + internal_nodes * @sizeOf([max_slots + 1]?*Node),
             };
         }
 
@@ -626,7 +626,14 @@ pub fn BTreeMap(
 
         fn newNode(self: *Self, leaf: bool, parent: ?*Node, position: usize) Allocator.Error!*Node {
             const n = try self.allocator.create(Node);
+            errdefer self.allocator.destroy(n);
+            const children = if (leaf) null else children: {
+                const ptr = try self.allocator.create([max_slots + 1]?*Node);
+                ptr.* = [_]?*Node{null} ** (max_slots + 1);
+                break :children ptr;
+            };
             n.* = Node.init(leaf, parent, position);
+            n.children = children;
             return n;
         }
 
@@ -634,9 +641,14 @@ pub fn BTreeMap(
             if (!n.leaf) {
                 var i: usize = 0;
                 while (i <= n.count()) : (i += 1) {
-                    if (n.children[i]) |c| self.destroySubtree(c);
+                    if (n.children.?[i]) |c| self.destroySubtree(c);
                 }
             }
+            self.destroyNode(n);
+        }
+
+        fn destroyNode(self: *Self, n: *Node) void {
+            if (n.children) |children| self.allocator.destroy(children);
             self.allocator.destroy(n);
         }
 
@@ -645,14 +657,14 @@ pub fn BTreeMap(
             const new_root = try self.newNode(false, null, 0);
             old.parent = new_root;
             old.position = 0;
-            new_root.children[0] = old;
+            new_root.children.?[0] = old;
             self.root = new_root;
             self.splitChild(new_root, 0) catch |err| {
                 old.parent = null;
                 old.position = 0;
-                new_root.children[0] = null;
+                new_root.children.?[0] = null;
                 self.root = old;
-                self.allocator.destroy(new_root);
+                self.destroyNode(new_root);
                 return err;
             };
         }
@@ -673,11 +685,11 @@ pub fn BTreeMap(
             if (!left.leaf) {
                 j = 0;
                 while (j <= right_len) : (j += 1) {
-                    const c = left.children[median_index + 1 + j].?;
-                    right.children[j] = c;
+                    const c = left.children.?[median_index + 1 + j].?;
+                    right.children.?[j] = c;
                     c.parent = right;
                     c.position = narrowPos(j);
-                    left.children[median_index + 1 + j] = null;
+                    left.children.?[median_index + 1 + j] = null;
                 }
             }
             right.len = narrowLen(right_len);
@@ -685,7 +697,7 @@ pub fn BTreeMap(
             left.len = narrowLen(median_index);
 
             shiftChildrenRight(parent, child_index + 1);
-            parent.children[child_index + 1] = right;
+            parent.children.?[child_index + 1] = right;
             shiftEntriesRight(parent, child_index);
             parent.entries[child_index] = median;
             parent.len += 1;
@@ -713,11 +725,15 @@ pub fn BTreeMap(
         }
 
         fn containsInSubtree(self: *const Self, start: *const Node, key_: *const Key) bool {
+            return self.findEntryInSubtree(start, key_) != null;
+        }
+
+        fn findEntryInSubtree(self: *const Self, start: anytype, key_: *const Key) ?@TypeOf(&start.entries[0]) {
             var n = start;
             while (true) {
                 const i = self.lowerBoundInNode(n, key_);
-                if (i < n.count() and self.keysEqual(key_, &n.entries[i].key)) return true;
-                if (n.leaf) return false;
+                if (i < n.count() and self.keysEqual(key_, &n.entries[i].key)) return &n.entries[i];
+                if (n.leaf) return null;
                 n = childAt(n, i);
             }
         }
@@ -818,8 +834,8 @@ pub fn BTreeMap(
             if (!left.leaf) {
                 j = 0;
                 while (j <= right.count()) : (j += 1) {
-                    const c = right.children[j].?;
-                    left.children[left_len + 1 + j] = c;
+                    const c = right.children.?[j].?;
+                    left.children.?[left_len + 1 + j] = c;
                     c.parent = left;
                     c.position = narrowPos(left_len + 1 + j);
                 }
@@ -828,7 +844,7 @@ pub fn BTreeMap(
 
             removeEntryAt(parent, left_index);
             removeChildAt(parent, left_index + 1);
-            self.allocator.destroy(right);
+            self.destroyNode(right);
             fixChildPositions(parent, left_index);
             return left;
         }
@@ -837,7 +853,7 @@ pub fn BTreeMap(
             const r = self.root orelse return;
             if (r.count() != 0) return;
             if (r.leaf) {
-                self.allocator.destroy(r);
+                self.destroyNode(r);
                 self.root = null;
                 return;
             }
@@ -845,7 +861,7 @@ pub fn BTreeMap(
             child.parent = null;
             child.position = 0;
             self.root = child;
-            self.allocator.destroy(r);
+            self.destroyNode(r);
         }
 
         inline fn lowerBoundInNode(self: *const Self, n: *const Node, key_: *const Key) usize {
@@ -1126,7 +1142,7 @@ fn narrowPos(x: usize) u16 {
 
 inline fn childAt(n: anytype, idx: usize) *@TypeOf(n.*) {
     std.debug.assert(idx <= @as(usize, n.len));
-    return n.children[idx].?;
+    return n.children.?[idx].?;
 }
 
 fn shiftEntriesRight(n: anytype, start: usize) void {
@@ -1139,7 +1155,7 @@ fn shiftEntriesRight(n: anytype, start: usize) void {
 fn shiftChildrenRight(n: anytype, start: usize) void {
     var i = @as(usize, n.len) + 1;
     while (i > start) : (i -= 1) {
-        n.children[i] = n.children[i - 1];
+        n.children.?[i] = n.children.?[i - 1];
     }
 }
 
@@ -1163,16 +1179,16 @@ fn removeChildAt(n: anytype, idx: usize) void {
     std.debug.assert(idx <= @as(usize, n.len) + 1);
     var i = idx;
     while (i + 1 <= @as(usize, n.len) + 1) : (i += 1) {
-        n.children[i] = n.children[i + 1];
+        n.children.?[i] = n.children.?[i + 1];
     }
-    n.children[@as(usize, n.len) + 1] = null;
+    n.children.?[@as(usize, n.len) + 1] = null;
 }
 
 fn fixChildPositions(parent: anytype, start: usize) void {
     if (parent.leaf) return;
     var i = start;
     while (i <= @as(usize, parent.len)) : (i += 1) {
-        if (parent.children[i]) |c| {
+        if (parent.children.?[i]) |c| {
             c.parent = parent;
             c.position = narrowPos(i);
         }
@@ -1188,11 +1204,11 @@ fn borrowFromLeft(parent: anytype, idx: usize) void {
     shiftEntriesRight(child, 0);
     if (!child.leaf) {
         shiftChildrenRight(child, 0);
-        const moved_child = left.children[left.count()].?;
-        child.children[0] = moved_child;
+        const moved_child = left.children.?[left.count()].?;
+        child.children.?[0] = moved_child;
         moved_child.parent = child;
         moved_child.position = 0;
-        left.children[left.count()] = null;
+        left.children.?[left.count()] = null;
     }
     child.entries[0] = parent.entries[idx - 1];
     child.len += 1;
@@ -1210,8 +1226,8 @@ fn borrowFromRight(parent: anytype, idx: usize) void {
     const child_len = child.count();
     child.entries[child_len] = parent.entries[idx];
     if (!child.leaf) {
-        const moved_child = right.children[0].?;
-        child.children[child_len + 1] = moved_child;
+        const moved_child = right.children.?[0].?;
+        child.children.?[child_len + 1] = moved_child;
         moved_child.parent = child;
         moved_child.position = narrowPos(child_len + 1);
     }
@@ -1221,9 +1237,9 @@ fn borrowFromRight(parent: anytype, idx: usize) void {
     if (!right.leaf) {
         var j: usize = 0;
         while (j <= right.count()) : (j += 1) {
-            right.children[j] = right.children[j + 1];
+            right.children.?[j] = right.children.?[j + 1];
         }
-        right.children[right.count() + 1] = null;
+        right.children.?[right.count() + 1] = null;
         fixChildPositions(right, 0);
     }
 }
