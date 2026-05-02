@@ -1017,3 +1017,18 @@
 - Proposed next architecture:
   - Inspect generated x86_64 assembly for `Group.load`, `matchByteWord`, `findIndex`, and `findOrInsertIndexAssumeCapacity`.
   - Prototype a real SSE2 group backend equivalent to C++ `GroupSse2Impl` using compare + movemask semantics, or document the Zig/codegen blocker if that cannot be expressed cleanly.
+
+## 2026-05-02T11:30:45+08:00 - Goal 0004 portability direction
+
+- Description: Confirmed with the user that Goal 0004 should keep `zig_phmap` portable and should not pursue micro-improvements that only optimize x86_64.
+- Files changed:
+  - `checkpoints.md`
+- Investigation notes:
+  - A local uncommitted x86_64 `@Vector(16, u8)` group prototype proved Zig can emit `pcmpeqb` + `pmovmskb` when bitcasting `@Vector(16, bool)` to `u16`.
+  - The prototype was removed from the worktree because it is x86_64-only and does not match the requested portable-library direction.
+  - The current implementation remains on the portable word-group backend.
+- Correctness commands after removing the prototype:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig test zig_phmap/src/phmap.zig -target x86_64-linux -O ReleaseFast -fno-emit-bin`: pass
+- Next optimization hypothesis:
+  - Focus on portable changes that reduce shared insertion/probe work across all targets, or design a backend abstraction only if every architecture has a correct portable fallback and the public behavior remains architecture-neutral.
