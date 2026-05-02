@@ -5,7 +5,6 @@
 //! drive probing and tombstone cleanup.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub const Config = struct {
     max_load_percent: u8 = 87,
@@ -15,7 +14,7 @@ pub const Config = struct {
 const empty: u8 = 0x80;
 const deleted: u8 = 0xfe;
 const sentinel: u8 = 0xff;
-const group_width: usize = if (builtin.cpu.arch == .x86_64) 16 else 8;
+const group_width: usize = 8;
 const GroupMask = std.meta.Int(.unsigned, group_width * 8);
 
 pub fn AutoFlatHashMap(comptime Key: type, comptime Value: type) type {
