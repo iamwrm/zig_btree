@@ -16,7 +16,6 @@ const empty: u8 = 0x80;
 const deleted: u8 = 0xfe;
 const sentinel: u8 = 0xff;
 const vector_group = builtin.cpu.arch == .x86_64;
-const tombstone_free_fast_path = builtin.cpu.arch == .x86_64;
 const group_width: usize = if (vector_group) 16 else 8;
 const GroupMask = std.meta.Int(.unsigned, group_width * 8);
 
@@ -174,9 +173,7 @@ pub fn FlatHashMap(
         }
 
         pub fn put(self: *Self, key: Key, value: Value) !PutResult {
-            const result = if (tombstone_free_fast_path and self.hasTombstoneFreeInsertionCapacity())
-                self.findOrInsertIndexNoDeletedAssumeCapacity(key)
-            else if (self.hasInsertionCapacity())
+            const result = if (self.hasInsertionCapacity())
                 self.findOrInsertIndexAssumeCapacity(key)
             else
                 try self.findOrInsertIndex(key);
@@ -197,9 +194,7 @@ pub fn FlatHashMap(
         }
 
         pub fn getOrPut(self: *Self, key: Key) !InsertResult {
-            const result = if (tombstone_free_fast_path and self.hasTombstoneFreeInsertionCapacity())
-                self.findOrInsertIndexNoDeletedAssumeCapacity(key)
-            else if (self.hasInsertionCapacity())
+            const result = if (self.hasInsertionCapacity())
                 self.findOrInsertIndexAssumeCapacity(key)
             else
                 try self.findOrInsertIndex(key);
@@ -208,55 +203,11 @@ pub fn FlatHashMap(
 
         inline fn findOrInsertIndex(self: *Self, key: Key) !IndexResult {
             try self.ensureAdditionalCapacity(1);
-            if (tombstone_free_fast_path and self.deleted_count == 0) return self.findOrInsertIndexNoDeletedAssumeCapacity(key);
             return self.findOrInsertIndexAssumeCapacity(key);
-        }
-
-        inline fn hasTombstoneFreeInsertionCapacity(self: *const Self) bool {
-            return self.growth_left != 0 and self.deleted_count == 0;
         }
 
         inline fn hasInsertionCapacity(self: *const Self) bool {
             return self.growth_left != 0 and self.deleted_count * 2 < self.entries.len;
-        }
-
-        inline fn findOrInsertIndexNoDeletedAssumeCapacity(self: *Self, key: Key) IndexResult {
-            const h = hashFn(self.context, key);
-            const fp = fingerprint(h);
-            var index = startIndex(self.entries.len, h);
-            while (true) : (index = nextGroupIndex(self.entries.len, index)) {
-                const first_ctrl = self.ctrl[index];
-                if (first_ctrl == empty) {
-                    self.growth_left -= 1;
-                    self.setCtrl(index, fp);
-                    self.entries[index].key = key;
-                    self.count += 1;
-                    return .{ .index = index, .inserted = true };
-                }
-                if (first_ctrl == fp and eqlFn(self.context, self.entries[index].key, key)) {
-                    return .{ .index = index, .inserted = false };
-                }
-
-                const group = Group.load(self.ctrl, index);
-                var matches = group.match(fp) & ~byteMask(0);
-                while (matches != 0) {
-                    const bit = takeLowestByte(&matches);
-                    const candidate = slotAt(self.entries.len, index, bit);
-                    if (eqlFn(self.context, self.entries[candidate].key, key)) {
-                        return .{ .index = candidate, .inserted = false };
-                    }
-                }
-
-                const empty_mask = group.matchEmptyOrDeleted() & ~byteMask(0);
-                if (empty_mask != 0) {
-                    const target = slotAt(self.entries.len, index, lowestByte(empty_mask));
-                    self.growth_left -= 1;
-                    self.setCtrl(target, fp);
-                    self.entries[target].key = key;
-                    self.count += 1;
-                    return .{ .index = target, .inserted = true };
-                }
-            }
         }
 
         inline fn findOrInsertIndexAssumeCapacity(self: *Self, key: Key) IndexResult {
@@ -513,7 +464,6 @@ pub fn FlatHashMap(
 
         inline fn findIndex(self: *const Self, key: Key) ?usize {
             if (self.entries.len == 0) return null;
-            if (tombstone_free_fast_path and self.deleted_count == 0) return self.findIndexNoDeleted(key);
             const h = hashFn(self.context, key);
             const fp = fingerprint(h);
             var index = startIndex(self.entries.len, h);
@@ -529,25 +479,6 @@ pub fn FlatHashMap(
                     if (eqlFn(self.context, self.entries[candidate].key, key)) return candidate;
                 }
                 if (group.matchByte(empty) != 0) return null;
-            }
-        }
-
-        inline fn findIndexNoDeleted(self: *const Self, key: Key) ?usize {
-            const h = hashFn(self.context, key);
-            const fp = fingerprint(h);
-            var index = startIndex(self.entries.len, h);
-            while (true) : (index = nextGroupIndex(self.entries.len, index)) {
-                const group = Group.load(self.ctrl, index);
-                if (group.firstByte() == fp) {
-                    if (eqlFn(self.context, self.entries[index].key, key)) return index;
-                }
-                var matches = group.match(fp) & ~byteMask(0);
-                while (matches != 0) {
-                    const bit = takeLowestByte(&matches);
-                    const candidate = slotAt(self.entries.len, index, bit);
-                    if (eqlFn(self.context, self.entries[candidate].key, key)) return candidate;
-                }
-                if (group.matchEmptyOrDeleted() != 0) return null;
             }
         }
 

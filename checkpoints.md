@@ -968,3 +968,26 @@
   - The x86_64-only experiment needs GitHub Actions validation before it can be kept.
 - Next optimization hypothesis:
   - Push the x86_64 no-tombstone experiment and inspect the median CI result. If it does not improve `insert_reserved` and miss-heavy workloads, remove it and move to generated assembly/SSE movemask work.
+
+## 2026-05-02T11:17:53+08:00 - Goal 0004 x86 no-tombstone experiment rejected
+
+- Description: Inspected GitHub Actions run `25242447600` from commit `cfea1a508d24aa9658e3e0c612ea85fb2a9876f8`; the x86_64-only no-tombstone fast path regressed the primary workload and several secondary workloads, so it was removed.
+- Files changed:
+  - `checkpoints.md`
+  - `zig_phmap/src/phmap.zig`
+- GitHub Actions median benchmark from run `25242447600`:
+  - insert_reserved: Zig 36.773 ns/op, C++ 30.454 ns/op, Zig is 20.7% slower.
+  - lookup_hit: Zig 19.252 ns/op, C++ 17.493 ns/op, Zig is 10.1% slower.
+  - lookup_miss: Zig 6.902 ns/op, C++ 4.472 ns/op, Zig is 54.3% slower.
+  - iterate: Zig 2.509 ns/item, C++ 4.703 ns/item, Zig is 46.7% faster.
+  - mixed: Zig 45.574 ns/op, C++ 41.068 ns/op, Zig is 11.0% slower.
+  - remove: Zig 25.176 ns/op, C++ 31.981 ns/op, Zig is 21.3% faster.
+  - string_insert: Zig 24.766 ns/op, C++ 62.238 ns/op, Zig is 60.2% faster.
+  - string_lookup: Zig 14.185 ns/op, C++ 15.286 ns/op, Zig is 7.2% faster.
+  - high_load_miss: Zig 23.114 ns/op, C++ 15.880 ns/op, Zig is 45.6% slower.
+  - tombstone_churn: Zig 17.058 ns/op, C++ 13.689 ns/op, Zig is 24.6% slower.
+- Decision:
+  - Removed `findOrInsertIndexNoDeletedAssumeCapacity()`, `findIndexNoDeleted()`, and the x86_64 `tombstone_free_fast_path` gate.
+  - Keep only the median workflow improvement from this pass.
+- Next optimization hypothesis:
+  - Language-level branch restructuring is not enough. The next meaningful path is generated x86_64 assembly inspection and an explicit SSE2/movemask-style group implementation if Zig can expose codegen comparable to C++ `GroupSse2Impl`.
