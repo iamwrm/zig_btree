@@ -1088,3 +1088,34 @@
   - Keep the portable `matchEmpty()` change. It does not complete the goal, but it improves the median x86_64 `insert_reserved` gap compared with the restored-code median run and keeps the implementation portable.
 - Next optimization hypothesis:
   - Continue with portable insertion fast-path branch reduction, especially avoiding deleted-slot checks when the selected insertion target is known to be empty.
+
+## 2026-05-02T11:40:16+08:00 - Goal 0004 portable insertion target branch reduction
+
+- Description: Split the insertion target accounting paths so known deleted slots decrement `deleted_count` and known empty slots decrement `growth_left` without re-reading `ctrl[target]`.
+- Files changed:
+  - `checkpoints.md`
+  - `zig_phmap/src/phmap.zig`
+- Implementation notes:
+  - The first-byte empty fast path now chooses between `first_deleted` and `index` with direct accounting.
+  - The later group empty-mask path now chooses between `first_deleted` and the empty-mask slot with direct accounting.
+  - This is a portable branch reduction in the shared insertion path; no target-specific code was added.
+- Correctness commands:
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig test zig_phmap/src/phmap.zig -target x86_64-linux -O ReleaseFast -fno-emit-bin`: pass
+- Local aarch64 median benchmark:
+  - insert_reserved: Zig 26.267 ns/op, C++ 33.858 ns/op, Zig is 22.4% faster.
+  - lookup_hit: Zig 7.622 ns/op, C++ 15.740 ns/op, Zig is 51.6% faster.
+  - lookup_miss: Zig 3.309 ns/op, C++ 4.555 ns/op, Zig is 27.4% faster.
+  - iterate: Zig 1.959 ns/item, C++ 4.193 ns/item, Zig is 53.3% faster.
+  - mixed: Zig 26.855 ns/op, C++ 41.619 ns/op, Zig is 35.5% faster.
+  - remove: Zig 7.500 ns/op, C++ 22.589 ns/op, Zig is 66.8% faster.
+  - string_insert: Zig 13.349 ns/op, C++ 37.221 ns/op, Zig is 64.1% faster.
+  - string_lookup: Zig 10.157 ns/op, C++ 26.697 ns/op, Zig is 62.0% faster.
+  - high_load_miss: Zig 18.219 ns/op, C++ 19.714 ns/op, Zig is 7.6% faster.
+  - tombstone_churn: Zig 11.914 ns/op, C++ 25.493 ns/op, Zig is 53.3% faster.
+- Notes:
+  - The local C++ samples were noisy in this run, so CI median validation is required before treating this as meaningful parity evidence.
+- Next optimization hypothesis:
+  - Push and inspect CI. Keep the change only if the x86_64 median benchmark does not regress the primary `insert_reserved` result.

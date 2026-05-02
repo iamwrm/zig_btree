@@ -218,12 +218,13 @@ pub fn FlatHashMap(
             while (true) : (index = nextGroupIndex(self.entries.len, index)) {
                 const first_ctrl = self.ctrl[index];
                 if (first_ctrl == empty) {
-                    const target = first_deleted orelse index;
-                    if (self.ctrl[target] == deleted) {
+                    const target = if (first_deleted) |deleted_slot| target: {
                         self.deleted_count -= 1;
-                    } else {
+                        break :target deleted_slot;
+                    } else target: {
                         self.growth_left -= 1;
-                    }
+                        break :target index;
+                    };
                     self.setCtrl(target, fp);
                     self.entries[target].key = key;
                     self.count += 1;
@@ -252,12 +253,13 @@ pub fn FlatHashMap(
 
                 const empty_mask = group.matchEmpty() & ~byteMask(0);
                 if (empty_mask != 0) {
-                    const target = first_deleted orelse slotAt(self.entries.len, index, lowestByte(empty_mask));
-                    if (self.ctrl[target] == deleted) {
+                    const target = if (first_deleted) |deleted_slot| target: {
                         self.deleted_count -= 1;
-                    } else {
+                        break :target deleted_slot;
+                    } else target: {
                         self.growth_left -= 1;
-                    }
+                        break :target slotAt(self.entries.len, index, lowestByte(empty_mask));
+                    };
                     self.setCtrl(target, fp);
                     self.entries[target].key = key;
                     self.count += 1;
