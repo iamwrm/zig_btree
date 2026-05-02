@@ -5,6 +5,7 @@
 //! drive probing and tombstone cleanup.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Config = struct {
     max_load_percent: u8 = 87,
@@ -14,8 +15,9 @@ pub const Config = struct {
 const empty: u8 = 0x80;
 const deleted: u8 = 0xfe;
 const sentinel: u8 = 0xff;
-const group_width: usize = 8;
-const GroupMask = std.meta.Int(.unsigned, group_width * 8);
+const vector_group = builtin.cpu.arch == .x86_64;
+const group_width: usize = if (vector_group) 16 else 8;
+const GroupMask = if (vector_group) u16 else u64;
 
 pub fn AutoFlatHashMap(comptime Key: type, comptime Value: type) type {
     return FlatHashMap(Key, Value, void, defaultHash(Key), defaultEql(Key), .{});
@@ -906,49 +908,86 @@ fn isFull(c: u8) bool {
     return c < 0x80;
 }
 
-const Group = struct {
-    word: GroupMask,
+const Group = if (vector_group) VectorGroup else PortableGroup;
 
-    inline fn load(ctrl: []const u8, index: usize) Group {
-        const ptr: *align(1) const GroupMask = @ptrCast(ctrl[index..].ptr);
-        return .{ .word = ptr.* };
+const VectorGroup = struct {
+    const Bytes = @Vector(group_width, u8);
+
+    bytes: Bytes,
+
+    inline fn load(ctrl: []const u8, index: usize) VectorGroup {
+        const ptr: *align(1) const Bytes = @ptrCast(ctrl[index..].ptr);
+        return .{ .bytes = ptr.* };
     }
 
-    inline fn match(g: Group, value: u8) GroupMask {
-        return matchByteWord(g.word, value);
+    inline fn match(g: VectorGroup, value: u8) GroupMask {
+        return @bitCast(g.bytes == @as(Bytes, @splat(value)));
     }
 
-    inline fn matchByte(g: Group, value: u8) GroupMask {
+    inline fn matchByte(g: VectorGroup, value: u8) GroupMask {
         return g.match(value);
     }
 
-    fn matchEmptyOrDeleted(g: Group) GroupMask {
+    inline fn matchEmptyOrDeleted(g: VectorGroup) GroupMask {
+        const empty_matches = g.bytes == @as(Bytes, @splat(empty));
+        const deleted_matches = g.bytes == @as(Bytes, @splat(deleted));
+        return @bitCast(empty_matches | deleted_matches);
+    }
+
+    inline fn matchFull(g: VectorGroup) GroupMask {
+        return @bitCast(g.bytes < @as(Bytes, @splat(@as(u8, 0x80))));
+    }
+
+    inline fn firstByte(g: VectorGroup) u8 {
+        return g.bytes[0];
+    }
+};
+
+const PortableGroup = struct {
+    word: u64,
+
+    inline fn load(ctrl: []const u8, index: usize) PortableGroup {
+        const ptr: *align(1) const u64 = @ptrCast(ctrl[index..].ptr);
+        return .{ .word = ptr.* };
+    }
+
+    inline fn match(g: PortableGroup, value: u8) GroupMask {
+        return matchByteWord(g.word, value);
+    }
+
+    inline fn matchByte(g: PortableGroup, value: u8) GroupMask {
+        return g.match(value);
+    }
+
+    inline fn matchEmptyOrDeleted(g: PortableGroup) GroupMask {
         return g.word & msbs;
     }
 
-    fn matchFull(g: Group) GroupMask {
+    inline fn matchFull(g: PortableGroup) GroupMask {
         return (~g.matchEmptyOrDeleted()) & msbs;
     }
 
-    inline fn firstByte(g: Group) u8 {
+    inline fn firstByte(g: PortableGroup) u8 {
         return @truncate(g.word);
     }
 };
 
-const lsbs: GroupMask = repeatedByte(0x01);
-const msbs: GroupMask = repeatedByte(0x80);
+const lsbs: u64 = 0x0101_0101_0101_0101;
+const msbs: u64 = 0x8080_8080_8080_8080;
 
-inline fn matchByteWord(word: GroupMask, value: u8) GroupMask {
-    const repeated = lsbs * @as(GroupMask, value);
+inline fn matchByteWord(word: u64, value: u8) u64 {
+    const repeated = lsbs * @as(u64, value);
     const x = word ^ repeated;
     return (x -% lsbs) & ~x & msbs;
 }
 
 inline fn byteMask(index: usize) GroupMask {
+    if (vector_group) return @as(GroupMask, 1) << @intCast(index);
     return @as(GroupMask, 0x80) << @intCast(index * 8);
 }
 
 inline fn lowestByte(mask: GroupMask) usize {
+    if (vector_group) return @ctz(mask);
     return @ctz(mask) >> 3;
 }
 
@@ -956,15 +995,6 @@ inline fn takeLowestByte(mask: *GroupMask) usize {
     const bit = lowestByte(mask.*);
     mask.* &= mask.* - 1;
     return bit;
-}
-
-fn repeatedByte(comptime byte: u8) GroupMask {
-    var out: GroupMask = 0;
-    var i: usize = 0;
-    while (i < group_width) : (i += 1) {
-        out |= @as(GroupMask, byte) << @intCast(i * 8);
-    }
-    return out;
 }
 
 pub fn defaultHash(comptime Key: type) fn (void, Key) u64 {
