@@ -682,3 +682,57 @@
   - The scalar `u128` 16-byte group improved insertion but hurt misses. The next candidate uses actual Zig vector compares and dense masks, which should better match upstream's SSE group model.
 - Next optimization hypothesis:
   - Push the vector-backed x86_64 group implementation and check whether it keeps the 16-byte insertion benefit while recovering the miss path.
+
+## 2026-05-02T10:50:44+08:00 - Goal 0004 third GitHub Actions benchmark and hybrid-group follow-up
+
+- Description: Pushed commit `baf851e9f984ddd800d46e49d3a5c4cfb641a620` with vector-backed x86_64 groups and inspected GitHub Actions run `25241888209`. Then changed the x86_64 implementation to a hybrid: scalar 16-byte word masks for insertion and vector dense masks for `findIndex()`.
+- Files changed:
+  - `checkpoints.md`
+  - `zig_phmap/src/phmap.zig`
+- Benchmark commands:
+  - GitHub Actions `zig_phmap_bench` run `25241888209`
+  - `"${ZIG}" build -Doptimize=ReleaseFast bench`
+  - `.deps/parallel_hashmap_bench`
+- Zig benchmark from GitHub Actions x86_64 with vector-backed groups:
+  - insert_reserved: 34.704 ns/op
+  - lookup_hit: 12.302 ns/op
+  - lookup_miss: 4.792 ns/op
+  - iterate: 2.173 ns/item
+  - mixed: 35.576 ns/op
+  - remove: 14.996 ns/op
+  - string_insert: 33.121 ns/op
+  - string_lookup: 18.849 ns/op
+  - high_load_miss: 21.292 ns/op
+  - tombstone_churn: 17.820 ns/op
+- C++ `parallel-hashmap` benchmark from GitHub Actions x86_64:
+  - insert_reserved: 30.618 ns/op
+  - lookup_hit: 14.721 ns/op
+  - lookup_miss: 4.894 ns/op
+  - iterate: 6.023 ns/item
+  - mixed: 42.808 ns/op
+  - remove: 32.523 ns/op
+  - string_insert: 80.696 ns/op
+  - string_lookup: 22.696 ns/op
+  - high_load_miss: 19.228 ns/op
+  - tombstone_churn: 15.542 ns/op
+- Percentage gaps, Zig versus C++:
+  - insert_reserved: Zig is 13.3% slower.
+  - lookup_hit: Zig is 16.4% faster.
+  - lookup_miss: Zig is 2.1% faster.
+  - iterate: Zig is 63.9% faster.
+  - mixed: Zig is 16.9% faster.
+  - remove: Zig is 53.9% faster.
+  - string_insert: Zig is 59.0% faster.
+  - string_lookup: Zig is 17.0% faster.
+  - high_load_miss: Zig is 10.7% slower.
+  - tombstone_churn: Zig is 14.7% slower.
+- Correctness commands:
+  - GitHub Actions `"${ZIG}" build -Doptimize=ReleaseFast test`: pass
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass after hybrid-group follow-up
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig test zig_phmap/src/phmap.zig -target x86_64-linux -O ReleaseFast -fno-emit-bin`: pass after hybrid-group follow-up
+  - `/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig test -target x86_64-linux -O ReleaseFast --dep phmap -Mroot=zig_phmap/test/phmap_stress.zig -Mphmap=zig_phmap/src/phmap.zig -fno-emit-bin`: pass after hybrid-group follow-up
+- Notes:
+  - The pure vector group fixed `lookup_miss` but did not preserve the scalar 16-byte insertion gain.
+  - The next candidate keeps scalar word masks for insertion and uses vector masks only for `findIndex()`, aiming to combine the best observed insertion and lookup behavior.
+- Next optimization hypothesis:
+  - Push the hybrid group and validate whether x86_64 `insert_reserved` returns to the scalar 16-byte result while `lookup_miss` stays near C++.
