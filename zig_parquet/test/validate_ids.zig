@@ -17,10 +17,16 @@ pub fn main(init: std.process.Init) !void {
     defer parsed.deinit();
     if (parsed.metadata.num_rows != expected_rows) return error.BadRowCount;
     if (parsed.metadata.schema.columns.len == 0) return error.BadColumnCount;
+    if (parsed.columnIndexByPath("id") != 0) return error.BadColumnCount;
+    const id_is_optional = parsed.metadata.schema.columns[0].repetition == .optional;
 
     var expected: i64 = 0;
     for (0..parsed.metadata.row_groups.len) |rg_idx| {
-        var info_iter = try parsed.columnPageInfoIterator(init.gpa, rg_idx, 0);
+        if (try parsed.readColumnPageIndexByPath(init.gpa, rg_idx, "id")) |entries| {
+            parquet.thrift.freePageIndexEntries(init.gpa, entries);
+        }
+
+        var info_iter = try parsed.columnPageInfoIteratorByPath(init.gpa, rg_idx, "id");
         defer info_iter.deinit();
         var info_expected: i64 = expected;
         while (try info_iter.next()) |page_info_value| {
@@ -36,13 +42,14 @@ pub fn main(init: std.process.Init) !void {
         }
         if (info_expected != expected + parsed.metadata.row_groups[rg_idx].num_rows) return error.BadPageInfo;
 
-        var pages = try parsed.columnPageIterator(init.gpa, rg_idx, 0);
+        var pages = try parsed.columnPageIteratorByPath(init.gpa, rg_idx, "id");
         defer pages.deinit();
         while (try pages.next()) |page| {
             var ids_col = page;
             defer ids_col.deinit(init.gpa);
             switch (ids_col) {
                 .int64 => |ids| {
+                    try checkValidity(ids.validity, ids.values.len, id_is_optional);
                     for (ids.values) |id| {
                         if (id != expected) return error.BadIdSequence;
                         expected += 1;
@@ -53,4 +60,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (expected != expected_rows) return error.BadRowCount;
+}
+
+fn checkValidity(validity: ?[]const bool, row_count: usize, expected_optional: bool) !void {
+    if (!expected_optional) {
+        if (validity != null) return error.BadColumnType;
+        return;
+    }
+    const values = validity orelse return;
+    if (values.len != row_count) return error.BadRowCount;
+    for (values) |valid| {
+        if (!valid) return error.BadColumnType;
+    }
 }

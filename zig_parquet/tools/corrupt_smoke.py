@@ -31,31 +31,36 @@ def assert_clean_failure(proc: subprocess.CompletedProcess[str], label: str) -> 
 
 def main() -> int:
     TMP.mkdir(parents=True, exist_ok=True)
-    base = TMP / "corrupt_base.parquet"
-    run([str(ZIG_WRITER), str(base)])
-    data = bytearray(base.read_bytes())
     rng = random.Random(0x5EED)
 
-    cases: list[bytes] = []
-    for size in (0, 1, 2, 3, 4, 7, 8, 11, 12, 16, 32, max(0, len(data) - 1)):
-        cases.append(bytes(data[:size]))
+    codecs = ["uncompressed", "snappy", "gzip", "lz4_raw", "zstd"]
+    total_cases = 0
+    for codec in codecs:
+        base = TMP / f"corrupt_base_{codec}.parquet"
+        run([str(ZIG_WRITER), str(base), codec])
+        data = bytearray(base.read_bytes())
 
-    for _ in range(96):
-        mutated = bytearray(data)
-        for _ in range(rng.randint(1, 8)):
-            idx = rng.randrange(len(mutated))
-            mutated[idx] ^= rng.randrange(1, 256)
-        if rng.random() < 0.25:
-            del mutated[rng.randrange(len(mutated)) :]
-        cases.append(bytes(mutated))
+        cases: list[bytes] = []
+        for size in (0, 1, 2, 3, 4, 7, 8, 11, 12, 16, 32, max(0, len(data) - 1)):
+            cases.append(bytes(data[:size]))
 
-    for idx, payload in enumerate(cases):
-        path = TMP / f"corrupt_{idx:03d}.parquet"
-        path.write_bytes(payload)
-        proc = run([str(ZIG_READER), str(path)], check=False)
-        assert_clean_failure(proc, path.name)
+        for _ in range(96):
+            mutated = bytearray(data)
+            for _ in range(rng.randint(1, 8)):
+                idx = rng.randrange(len(mutated))
+                mutated[idx] ^= rng.randrange(1, 256)
+            if rng.random() < 0.25:
+                del mutated[rng.randrange(len(mutated)) :]
+            cases.append(bytes(mutated))
 
-    print(f"corrupt-smoke-ok cases={len(cases)}")
+        for idx, payload in enumerate(cases):
+            path = TMP / f"corrupt_{codec}_{idx:03d}.parquet"
+            path.write_bytes(payload)
+            proc = run([str(ZIG_READER), str(path)], check=False)
+            assert_clean_failure(proc, path.name)
+        total_cases += len(cases)
+
+    print(f"corrupt-smoke-ok cases={total_cases} codecs={len(codecs)}")
     return 0
 
 

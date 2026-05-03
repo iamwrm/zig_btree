@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const parquet = @import("parquet");
 
 const Mode = enum {
@@ -6,6 +7,21 @@ const Mode = enum {
     ids,
     score,
     name,
+};
+
+const ReaderState = enum {
+    reuse,
+    fresh,
+};
+
+const OsCacheMode = enum {
+    keep,
+    evict,
+};
+
+const ColumnExecution = enum {
+    serial,
+    parallel,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -16,6 +32,10 @@ pub fn main(init: std.process.Init) !void {
     const expected_rows = try std.fmt.parseInt(i64, expected_rows_arg, 10);
     const mode_arg = args.next() orelse "all";
     const iterations_arg = args.next() orelse "5";
+    const cache_arg = args.next() orelse "no-cache";
+    const reader_state_arg = args.next() orelse "reuse-reader";
+    const os_cache_arg = args.next() orelse "keep-os-cache";
+    const column_execution_arg = args.next() orelse "serial-columns";
     const mode: Mode = if (std.mem.eql(u8, mode_arg, "all"))
         .all
     else if (std.mem.eql(u8, mode_arg, "ids"))
@@ -28,40 +48,158 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidColumnData;
     const iterations = try std.fmt.parseInt(usize, iterations_arg, 10);
     if (iterations == 0) return error.InvalidColumnData;
+    const cache_dictionaries = if (std.mem.eql(u8, cache_arg, "cache-dictionaries"))
+        true
+    else if (std.mem.eql(u8, cache_arg, "no-cache"))
+        false
+    else
+        return error.InvalidColumnData;
+    const reader_state: ReaderState = if (std.mem.eql(u8, reader_state_arg, "reuse-reader"))
+        .reuse
+    else if (std.mem.eql(u8, reader_state_arg, "fresh-reader"))
+        .fresh
+    else
+        return error.InvalidColumnData;
+    const os_cache: OsCacheMode = if (std.mem.eql(u8, os_cache_arg, "keep-os-cache") or std.mem.eql(u8, os_cache_arg, "keep-cache"))
+        .keep
+    else if (std.mem.eql(u8, os_cache_arg, "evict-os-cache") or std.mem.eql(u8, os_cache_arg, "evict-cache"))
+        .evict
+    else
+        return error.InvalidColumnData;
+    const column_execution: ColumnExecution = if (std.mem.eql(u8, column_execution_arg, "serial-columns"))
+        .serial
+    else if (std.mem.eql(u8, column_execution_arg, "parallel-columns"))
+        .parallel
+    else
+        return error.InvalidColumnData;
 
-    var file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
-    defer file.close(init.io);
-
-    var reader_buffer: [64 * 1024]u8 = undefined;
-    var io_reader = file.reader(init.io, &reader_buffer);
-    var parsed = try parquet.reader.StreamFileReader.init(init.gpa, &io_reader);
-    defer parsed.deinit();
-    if (parsed.metadata.num_rows != expected_rows) return error.BadRowCount;
-
-    var checksum = try readOnce(init.gpa, &parsed, mode, expected_rows, true);
-    const start = std.Io.Timestamp.now(init.io, .awake);
-    for (0..iterations) |_| {
-        checksum +%= try readOnce(init.gpa, &parsed, mode, expected_rows, false);
-    }
-    const end = std.Io.Timestamp.now(init.io, .awake);
-    const elapsed_ns = start.durationTo(end).toNanoseconds();
+    const result = switch (reader_state) {
+        .reuse => try benchReuseReader(init, path, expected_rows, mode, iterations, cache_dictionaries, os_cache, column_execution),
+        .fresh => try benchFreshReaders(init, path, expected_rows, mode, iterations, cache_dictionaries, os_cache, column_execution),
+    };
 
     var stdout_buffer: [256]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
     try stdout.print("rows={d}\n", .{expected_rows});
     try stdout.print("iterations={d}\n", .{iterations});
-    try stdout.print("elapsed_ns={d}\n", .{elapsed_ns});
-    try stdout.print("checksum={d}\n", .{checksum});
+    try stdout.print("elapsed_ns={d}\n", .{result.elapsed_ns});
+    try stdout.print("checksum={d}\n", .{result.checksum});
     try stdout.flush();
 }
 
-fn readOnce(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFileReader, mode: Mode, expected_rows: i64, validate_all: bool) !u64 {
+const BenchResult = struct {
+    elapsed_ns: i128,
+    checksum: u64,
+};
+
+fn benchReuseReader(init: std.process.Init, path: []const u8, expected_rows: i64, mode: Mode, iterations: usize, cache_dictionaries: bool, os_cache: OsCacheMode, column_execution: ColumnExecution) !BenchResult {
+    const allocator = std.heap.smp_allocator;
+    var file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
+    defer file.close(init.io);
+
+    var reader_buffer: [1024]u8 = undefined;
+    var io_reader = file.reader(init.io, &reader_buffer);
+    var parsed = try parquet.reader.StreamFileReader.init(allocator, &io_reader);
+    defer parsed.deinit();
+    parsed.setDictionaryCacheEnabled(cache_dictionaries);
+    if (parsed.metadata.num_rows != expected_rows) return error.BadRowCount;
+
+    var checksum = try readOnce(allocator, &parsed, mode, expected_rows, true, cache_dictionaries, column_execution);
+    var elapsed_ns: i128 = 0;
+    if (os_cache == .keep) {
+        const start = std.Io.Timestamp.now(init.io, .awake);
+        for (0..iterations) |_| {
+            checksum +%= try readOnce(allocator, &parsed, mode, expected_rows, false, cache_dictionaries, column_execution);
+        }
+        const end = std.Io.Timestamp.now(init.io, .awake);
+        elapsed_ns = start.durationTo(end).toNanoseconds();
+    } else {
+        for (0..iterations) |_| {
+            try evictFileCache(init, path);
+            const start = std.Io.Timestamp.now(init.io, .awake);
+            checksum +%= try readOnce(allocator, &parsed, mode, expected_rows, false, cache_dictionaries, column_execution);
+            const end = std.Io.Timestamp.now(init.io, .awake);
+            elapsed_ns += start.durationTo(end).toNanoseconds();
+        }
+    }
+    return .{
+        .elapsed_ns = elapsed_ns,
+        .checksum = checksum,
+    };
+}
+
+fn benchFreshReaders(init: std.process.Init, path: []const u8, expected_rows: i64, mode: Mode, iterations: usize, cache_dictionaries: bool, os_cache: OsCacheMode, column_execution: ColumnExecution) !BenchResult {
+    var checksum = try readFreshOnce(init, path, expected_rows, mode, cache_dictionaries, true, column_execution);
+    var elapsed_ns: i128 = 0;
+    if (os_cache == .keep) {
+        const start = std.Io.Timestamp.now(init.io, .awake);
+        for (0..iterations) |_| {
+            checksum +%= try readFreshOnce(init, path, expected_rows, mode, cache_dictionaries, false, column_execution);
+        }
+        const end = std.Io.Timestamp.now(init.io, .awake);
+        elapsed_ns = start.durationTo(end).toNanoseconds();
+    } else {
+        for (0..iterations) |_| {
+            try evictFileCache(init, path);
+            const start = std.Io.Timestamp.now(init.io, .awake);
+            checksum +%= try readFreshOnce(init, path, expected_rows, mode, cache_dictionaries, false, column_execution);
+            const end = std.Io.Timestamp.now(init.io, .awake);
+            elapsed_ns += start.durationTo(end).toNanoseconds();
+        }
+    }
+    return .{
+        .elapsed_ns = elapsed_ns,
+        .checksum = checksum,
+    };
+}
+
+fn evictFileCache(init: std.process.Init, path: []const u8) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOsCacheEviction;
+
+    var file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
+    defer file.close(init.io);
+
+    const rc = std.os.linux.fadvise(file.handle, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
+    switch (std.os.linux.errno(rc)) {
+        .SUCCESS => {},
+        .INVAL, .NOSYS => return error.UnsupportedOsCacheEviction,
+        else => return error.OsCacheEvictionFailed,
+    }
+}
+
+fn readFreshOnce(init: std.process.Init, path: []const u8, expected_rows: i64, mode: Mode, cache_dictionaries: bool, validate_all: bool, column_execution: ColumnExecution) !u64 {
+    const allocator = std.heap.smp_allocator;
+    var file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
+    defer file.close(init.io);
+
+    var reader_buffer: [1024]u8 = undefined;
+    var io_reader = file.reader(init.io, &reader_buffer);
+    var parsed = try parquet.reader.StreamFileReader.init(allocator, &io_reader);
+    defer parsed.deinit();
+    parsed.setDictionaryCacheEnabled(cache_dictionaries);
+    if (parsed.metadata.num_rows != expected_rows) return error.BadRowCount;
+    return try readOnce(allocator, &parsed, mode, expected_rows, validate_all, cache_dictionaries, column_execution);
+}
+
+fn readOnce(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFileReader, mode: Mode, expected_rows: i64, validate_all: bool, cache_dictionaries: bool, column_execution: ColumnExecution) !u64 {
     return switch (mode) {
-        .all => readAllColumns(allocator, parsed, expected_rows, validate_all),
-        .ids => readIdColumn(allocator, parsed, expected_rows, validate_all),
-        .score => readScoreColumn(allocator, parsed, expected_rows, validate_all),
-        .name => readNameColumn(allocator, parsed, expected_rows, validate_all),
+        .all => switch (column_execution) {
+            .serial => readAllColumns(allocator, parsed, expected_rows, validate_all),
+            .parallel => readAllColumnsParallel(allocator, parsed, expected_rows, validate_all, cache_dictionaries),
+        },
+        .ids => switch (column_execution) {
+            .serial => readIdColumn(allocator, parsed, expected_rows, validate_all),
+            .parallel => readIdColumnParallel(allocator, parsed, expected_rows, validate_all, cache_dictionaries),
+        },
+        .score => switch (column_execution) {
+            .serial => readScoreColumn(allocator, parsed, expected_rows, validate_all),
+            .parallel => readScoreColumnParallel(allocator, parsed, expected_rows, validate_all, cache_dictionaries),
+        },
+        .name => switch (column_execution) {
+            .serial => readNameColumn(allocator, parsed, expected_rows, validate_all),
+            .parallel => readNameColumnParallel(allocator, parsed, expected_rows, validate_all, cache_dictionaries),
+        },
     };
 }
 
@@ -82,6 +220,30 @@ fn readAllColumns(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFi
     return checksum;
 }
 
+fn readAllColumnsParallel(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFileReader, expected_rows: i64, validate_all: bool, cache_dictionaries: bool) !u64 {
+    if (parsed.metadata.schema.columns.len == 0) return error.BadColumnCount;
+    var expected: i64 = 0;
+    var checksum: u64 = 0;
+    const row_group_indexes = try allocator.alloc(usize, parsed.metadata.row_groups.len);
+    defer allocator.free(row_group_indexes);
+    for (row_group_indexes, 0..) |*row_group_index, idx| row_group_index.* = idx;
+
+    const batches = try parsed.readRowGroupsColumnsParallel(allocator, row_group_indexes, .{
+        .cache_dictionaries = cache_dictionaries,
+    });
+    defer {
+        for (batches) |*batch| batch.deinit(allocator);
+        allocator.free(batches);
+    }
+    for (batches, 0..) |batch, expected_rg_idx| {
+        if (batch.row_group_index != expected_rg_idx) return error.BadRowCount;
+        if (batch.columns.len != parsed.metadata.schema.columns.len) return error.BadColumnCount;
+        checksum +%= try checkIds(batch.columns[0], &expected, validate_all);
+    }
+    if (expected != expected_rows) return error.BadRowCount;
+    return checksum;
+}
+
 fn readIdColumn(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFileReader, expected_rows: i64, validate_all: bool) !u64 {
     if (parsed.metadata.schema.columns.len == 0) return error.BadColumnCount;
     var expected: i64 = 0;
@@ -95,6 +257,23 @@ fn readIdColumn(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFile
     return checksum;
 }
 
+fn readIdColumnParallel(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFileReader, expected_rows: i64, validate_all: bool, cache_dictionaries: bool) !u64 {
+    if (parsed.metadata.schema.columns.len == 0) return error.BadColumnCount;
+    const batches = try readSingleColumnRowGroupsParallel(allocator, parsed, 0, cache_dictionaries);
+    defer {
+        for (batches) |*batch| batch.deinit(allocator);
+        allocator.free(batches);
+    }
+    var expected: i64 = 0;
+    var checksum: u64 = 0;
+    for (batches, 0..) |batch, expected_rg_idx| {
+        if (batch.row_group_index != expected_rg_idx or batch.columns.len != 1) return error.BadRowCount;
+        checksum +%= try checkIds(batch.columns[0], &expected, validate_all);
+    }
+    if (expected != expected_rows) return error.BadRowCount;
+    return checksum;
+}
+
 fn readScoreColumn(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFileReader, expected_rows: i64, validate_all: bool) !u64 {
     if (parsed.metadata.schema.columns.len < 2) return error.BadColumnCount;
     var expected_start: usize = 0;
@@ -103,6 +282,23 @@ fn readScoreColumn(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamF
         var score_col = try parsed.readColumn(allocator, rg_idx, 1);
         defer score_col.deinit(allocator);
         checksum +%= try checkScores(score_col, &expected_start, validate_all);
+    }
+    if (expected_start != @as(usize, @intCast(expected_rows))) return error.BadRowCount;
+    return checksum;
+}
+
+fn readScoreColumnParallel(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFileReader, expected_rows: i64, validate_all: bool, cache_dictionaries: bool) !u64 {
+    if (parsed.metadata.schema.columns.len < 2) return error.BadColumnCount;
+    const batches = try readSingleColumnRowGroupsParallel(allocator, parsed, 1, cache_dictionaries);
+    defer {
+        for (batches) |*batch| batch.deinit(allocator);
+        allocator.free(batches);
+    }
+    var expected_start: usize = 0;
+    var checksum: u64 = 0;
+    for (batches, 0..) |batch, expected_rg_idx| {
+        if (batch.row_group_index != expected_rg_idx or batch.columns.len != 1) return error.BadRowCount;
+        checksum +%= try checkScores(batch.columns[0], &expected_start, validate_all);
     }
     if (expected_start != @as(usize, @intCast(expected_rows))) return error.BadRowCount;
     return checksum;
@@ -122,6 +318,35 @@ fn readNameColumn(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFi
     }
     if (row_start != @as(usize, @intCast(expected_rows))) return error.BadRowCount;
     return checksum;
+}
+
+fn readNameColumnParallel(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFileReader, expected_rows: i64, validate_all: bool, cache_dictionaries: bool) !u64 {
+    if (parsed.metadata.schema.columns.len < 3) return error.BadColumnCount;
+    const batches = try readSingleColumnRowGroupsParallel(allocator, parsed, 2, cache_dictionaries);
+    defer {
+        for (batches) |*batch| batch.deinit(allocator);
+        allocator.free(batches);
+    }
+    var row_start: usize = 0;
+    var checksum: u64 = 0;
+    for (batches, 0..) |batch, expected_rg_idx| {
+        if (batch.row_group_index != expected_rg_idx or batch.columns.len != 1) return error.BadRowCount;
+        const row_group_rows = std.math.cast(usize, parsed.metadata.row_groups[batch.row_group_index].num_rows) orelse return error.BadRowCount;
+        checksum +%= try checkNames(batch.columns[0], row_start, row_group_rows, validate_all);
+        row_start += row_group_rows;
+    }
+    if (row_start != @as(usize, @intCast(expected_rows))) return error.BadRowCount;
+    return checksum;
+}
+
+fn readSingleColumnRowGroupsParallel(allocator: std.mem.Allocator, parsed: *parquet.reader.StreamFileReader, column_index: usize, cache_dictionaries: bool) ![]parquet.reader.RowGroupColumns {
+    const row_group_indexes = try allocator.alloc(usize, parsed.metadata.row_groups.len);
+    defer allocator.free(row_group_indexes);
+    for (row_group_indexes, 0..) |*row_group_index, idx| row_group_index.* = idx;
+    const column_indexes = [_]usize{column_index};
+    return try parsed.readRowGroupsSelectedColumnsParallel(allocator, row_group_indexes, column_indexes[0..], .{
+        .cache_dictionaries = cache_dictionaries,
+    });
 }
 
 fn checkIds(column: parquet.OwnedColumn, expected: *i64, validate_all: bool) !u64 {

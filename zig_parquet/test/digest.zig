@@ -85,6 +85,10 @@ fn hashCell(hasher: *Sha256, column: *const parquet.OwnedColumn, row: usize, val
             const index = try valueIndex(hasher, data.validity, row, value_offset);
             if (index) |i| updateI64(hasher, data.values[i]);
         },
+        .int96 => |data| {
+            const index = try valueIndex(hasher, data.validity, row, value_offset);
+            if (index) |i| updateBytes(hasher, data.values[i]);
+        },
         .float => |data| {
             const index = try valueIndex(hasher, data.validity, row, value_offset);
             if (index) |i| updateU32(hasher, @bitCast(data.values[i]));

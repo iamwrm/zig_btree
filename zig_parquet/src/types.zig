@@ -112,8 +112,41 @@ pub const ColumnType = struct {
 
 pub const Column = struct {
     name: []const u8,
+    path: []const []const u8 = &.{},
     column_type: ColumnType,
     repetition: Repetition = .required,
+    max_definition_level: u16 = 0,
+    max_repetition_level: u16 = 0,
+    repeated_level_info: []const RepeatedLevelInfo = &.{},
+    nested_logical_info: []const NestedLogicalInfo = &.{},
+    list_info: ?ListInfo = null,
+    map_info: ?MapInfo = null,
+};
+
+pub const RepeatedLevelInfo = struct {
+    repetition_level: u16,
+    path: []const []const u8,
+};
+
+pub const NestedLogicalKind = enum {
+    list,
+    map,
+};
+
+pub const NestedLogicalInfo = struct {
+    kind: NestedLogicalKind,
+    definition_level: u16,
+    repetition_level: u16,
+    path: []const []const u8,
+    optional: bool = false,
+};
+
+pub const ListInfo = struct {
+    list_definition_level: u16,
+};
+
+pub const MapInfo = struct {
+    map_definition_level: u16,
 };
 
 pub const Schema = struct {
@@ -159,6 +192,7 @@ pub const ColumnData = union(enum) {
     boolean: BoolData,
     int32: Int32Data,
     int64: Int64Data,
+    int96: ByteArrayData,
     float: FloatData,
     double: DoubleData,
     byte_array: ByteArrayData,
@@ -169,6 +203,7 @@ pub const ColumnData = union(enum) {
             .boolean => .boolean,
             .int32 => .int32,
             .int64 => .int64,
+            .int96 => .int96,
             .float => .float,
             .double => .double,
             .byte_array => .byte_array,
@@ -215,6 +250,12 @@ pub const ColumnData = union(enum) {
         }
 
         switch (self) {
+            .int96 => |d| {
+                const width = try physicalTypeWidth(column.column_type.physical, column.column_type.type_length);
+                for (d.values) |value| {
+                    if (value.len != width) return error.InvalidColumnData;
+                }
+            },
             .fixed_len_byte_array => |d| {
                 const width = try physicalTypeWidth(column.column_type.physical, column.column_type.type_length);
                 for (d.values) |value| {
@@ -246,10 +287,67 @@ pub const Statistics = struct {
     }
 };
 
+pub const ColumnTripletData = struct {
+    values: ColumnData,
+    definition_levels: []const u16,
+    repetition_levels: []const u16,
+};
+
+pub const ColumnListData = struct {
+    values: ColumnData,
+    offsets: []const usize,
+    validity: ?[]const bool = null,
+};
+
+pub const ColumnNestedListLevelData = struct {
+    offsets: []const usize,
+    validity: ?[]const bool = null,
+};
+
+pub const ColumnNestedListData = struct {
+    values: ColumnData,
+    levels: []const ColumnNestedListLevelData,
+};
+
+pub const ColumnMapData = struct {
+    keys: ColumnData,
+    values: ?ColumnData = null,
+    offsets: []const usize,
+    validity: ?[]const bool = null,
+};
+
+pub const ColumnNestedMapLevelData = struct {
+    keys: ColumnData,
+    offsets: []const usize,
+    validity: ?[]const bool = null,
+};
+
+pub const ColumnNestedMapData = struct {
+    levels: []const ColumnNestedMapLevelData,
+    values: ?ColumnData = null,
+};
+
+pub const ColumnListMapData = struct {
+    list: ColumnNestedListLevelData,
+    map: ColumnNestedMapLevelData,
+    values: ?ColumnData = null,
+};
+
+pub const ColumnWriteData = union(enum) {
+    flat: ColumnData,
+    triplets: ColumnTripletData,
+    list: ColumnListData,
+    nested_list: ColumnNestedListData,
+    map: ColumnMapData,
+    nested_map: ColumnNestedMapData,
+    list_map: ColumnListMapData,
+};
+
 pub const StatisticsValue = union(enum) {
     boolean: bool,
     int32: i32,
     int64: i64,
+    int96: []const u8,
     float: f32,
     double: f64,
     byte_array: []const u8,
@@ -260,6 +358,7 @@ pub const ColumnChunkMeta = struct {
     physical_type: Type,
     encodings: []const Encoding,
     path: []const u8,
+    owned_path: ?[]u8 = null,
     codec: CompressionCodec,
     num_values: i64,
     total_uncompressed_size: i64,
@@ -279,6 +378,7 @@ pub const PageIndexEntry = struct {
     compressed_page_size: i32,
     first_row_index: i64,
     row_count: i64,
+    value_count: i64 = 0,
     statistics: Statistics = .{},
 };
 
@@ -336,6 +436,7 @@ pub const OwnedColumn = union(enum) {
     boolean: OwnedBool,
     int32: OwnedInt32,
     int64: OwnedInt64,
+    int96: OwnedByteArray,
     float: OwnedFloat,
     double: OwnedDouble,
     byte_array: OwnedByteArray,
@@ -346,11 +447,128 @@ pub const OwnedColumn = union(enum) {
             .boolean => |*v| v.deinit(allocator),
             .int32 => |*v| v.deinit(allocator),
             .int64 => |*v| v.deinit(allocator),
+            .int96 => |*v| v.deinit(allocator),
             .float => |*v| v.deinit(allocator),
             .double => |*v| v.deinit(allocator),
             .byte_array => |*v| v.deinit(allocator),
             .fixed_len_byte_array => |*v| v.deinit(allocator),
         }
+    }
+};
+
+pub const OwnedColumnTriplets = struct {
+    values: OwnedColumn,
+    definition_levels: []u16,
+    repetition_levels: []u16,
+    row_offsets: []usize = &.{},
+    value_offsets: []usize = &.{},
+    repeated_level_offsets: []TripletLevelOffsets = &.{},
+    max_definition_level: u16,
+    max_repetition_level: u16,
+
+    pub fn deinit(self: *OwnedColumnTriplets, allocator: std.mem.Allocator) void {
+        self.values.deinit(allocator);
+        allocator.free(self.definition_levels);
+        allocator.free(self.repetition_levels);
+        allocator.free(self.row_offsets);
+        allocator.free(self.value_offsets);
+        for (self.repeated_level_offsets) |level_offsets| allocator.free(level_offsets.offsets);
+        allocator.free(self.repeated_level_offsets);
+    }
+};
+
+pub const TripletLevelOffsets = struct {
+    repetition_level: u16,
+    offsets: []usize,
+};
+
+pub const NestedTripletLevel = struct {
+    repetition_level: u16,
+    path: []const []const u8,
+    offsets: []const usize,
+};
+
+pub const OwnedNestedColumnTriplets = struct {
+    triplets: OwnedColumnTriplets,
+    column_path: []const []const u8,
+    repeated_levels: []NestedTripletLevel,
+    logical_levels: []NestedLogicalInfo,
+
+    pub fn deinit(self: *OwnedNestedColumnTriplets, allocator: std.mem.Allocator) void {
+        self.triplets.deinit(allocator);
+        freeOwnedPath(allocator, self.column_path);
+        for (self.repeated_levels) |level| freeOwnedPath(allocator, level.path);
+        allocator.free(self.repeated_levels);
+        for (self.logical_levels) |level| freeOwnedPath(allocator, level.path);
+        allocator.free(self.logical_levels);
+    }
+};
+
+pub const NestedLogicalColumnLevel = struct {
+    kind: NestedLogicalKind,
+    definition_level: u16,
+    repetition_level: u16,
+    path: []const []const u8,
+    offsets: []usize,
+    validity: ?[]bool = null,
+};
+
+pub const OwnedNestedLogicalColumn = struct {
+    values: OwnedColumn,
+    levels: []NestedLogicalColumnLevel,
+    max_definition_level: u16,
+    max_repetition_level: u16,
+
+    pub fn deinit(self: *OwnedNestedLogicalColumn, allocator: std.mem.Allocator) void {
+        self.values.deinit(allocator);
+        for (self.levels) |level| {
+            freeOwnedPath(allocator, level.path);
+            allocator.free(level.offsets);
+            if (level.validity) |validity| allocator.free(validity);
+        }
+        allocator.free(self.levels);
+    }
+};
+
+pub const OwnedNestedMapPair = struct {
+    keys: OwnedNestedLogicalColumn,
+    values: ?OwnedNestedLogicalColumn = null,
+    key_map_level_index: usize,
+    value_map_level_index: ?usize = null,
+
+    pub fn deinit(self: *OwnedNestedMapPair, allocator: std.mem.Allocator) void {
+        self.keys.deinit(allocator);
+        if (self.values) |*values| values.deinit(allocator);
+    }
+};
+
+pub const OwnedListColumn = struct {
+    values: OwnedColumn,
+    offsets: []usize,
+    validity: ?[]bool = null,
+    max_definition_level: u16,
+    max_repetition_level: u16,
+
+    pub fn deinit(self: *OwnedListColumn, allocator: std.mem.Allocator) void {
+        self.values.deinit(allocator);
+        allocator.free(self.offsets);
+        if (self.validity) |v| allocator.free(v);
+    }
+};
+
+pub const OwnedMapColumn = struct {
+    keys: OwnedColumn,
+    values: ?OwnedColumn = null,
+    offsets: []usize,
+    validity: ?[]bool = null,
+    max_definition_level: u16,
+    max_repetition_level: u16,
+
+    pub fn deinit(self: *OwnedMapColumn, allocator: std.mem.Allocator) void {
+        self.keys.deinit(allocator);
+        if (self.values) |*values| values.deinit(allocator);
+        allocator.free(self.offsets);
+        if (self.validity) |v| allocator.free(v);
     }
 };
 
@@ -416,17 +634,22 @@ pub const OwnedByteArray = struct {
     }
 };
 
+fn freeOwnedPath(allocator: std.mem.Allocator, path: []const []const u8) void {
+    for (path) |part| allocator.free(part);
+    allocator.free(path);
+}
+
 pub fn physicalTypeWidth(t: Type, type_length: ?i32) Error!usize {
     return switch (t) {
         .boolean => 0,
         .int32, .float => 4,
         .int64, .double => 8,
+        .int96 => 12,
         .fixed_len_byte_array => if (type_length) |len| blk: {
             if (len <= 0) return error.InvalidSchema;
             break :blk @intCast(len);
         } else error.InvalidSchema,
         .byte_array => 0,
-        .int96 => error.UnsupportedType,
     };
 }
 
@@ -462,6 +685,10 @@ fn decodePhysicalStatistic(column_type: ColumnType, bytes: []const u8) Error!Sta
             if (bytes.len != 8) return error.CorruptMetadata;
             break :blk .{ .int64 = std.mem.readInt(i64, bytes[0..8], .little) };
         },
+        .int96 => blk: {
+            if (bytes.len != 12) return error.CorruptMetadata;
+            break :blk .{ .int96 = bytes };
+        },
         .float => blk: {
             if (bytes.len != 4) return error.CorruptMetadata;
             break :blk .{ .float = @bitCast(std.mem.readInt(u32, bytes[0..4], .little)) };
@@ -476,7 +703,6 @@ fn decodePhysicalStatistic(column_type: ColumnType, bytes: []const u8) Error!Sta
             if (bytes.len != width) return error.CorruptMetadata;
             break :blk .{ .fixed_len_byte_array = bytes };
         },
-        .int96 => error.UnsupportedType,
     };
 }
 

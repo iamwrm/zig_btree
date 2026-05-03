@@ -17,6 +17,7 @@ pub fn main(init: std.process.Init) !void {
     defer parsed.deinit();
     if (parsed.metadata.num_rows != expected_rows) return error.BadRowCount;
     if (parsed.metadata.schema.columns.len == 0) return error.BadColumnCount;
+    const id_is_optional = parsed.metadata.schema.columns[0].repetition == .optional;
 
     var expected: i64 = 0;
     for (0..parsed.metadata.row_groups.len) |rg_idx| {
@@ -27,6 +28,7 @@ pub fn main(init: std.process.Init) !void {
         }
         switch (columns[0]) {
             .int64 => |ids| {
+                try checkValidity(ids.validity, ids.values.len, id_is_optional);
                 for (ids.values) |id| {
                     if (id != expected) return error.BadIdSequence;
                     expected += 1;
@@ -36,4 +38,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (expected != expected_rows) return error.BadRowCount;
+}
+
+fn checkValidity(validity: ?[]const bool, row_count: usize, expected_optional: bool) !void {
+    if (!expected_optional) {
+        if (validity != null) return error.BadColumnType;
+        return;
+    }
+    const values = validity orelse return;
+    if (values.len != row_count) return error.BadRowCount;
+    for (values) |valid| {
+        if (!valid) return error.BadColumnType;
+    }
 }

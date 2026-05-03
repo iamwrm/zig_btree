@@ -30,6 +30,8 @@ pub fn main(init: std.process.Init) !void {
         .snappy
     else if (std.mem.eql(u8, codec_arg, "gzip"))
         .gzip
+    else if (std.mem.eql(u8, codec_arg, "lz4") or std.mem.eql(u8, codec_arg, "lz4_raw"))
+        .lz4_raw
     else if (std.mem.eql(u8, codec_arg, "zstd"))
         .zstd
     else

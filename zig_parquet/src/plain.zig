@@ -24,18 +24,143 @@ pub fn encodeDefinitionLevelsBody(writer: *std.Io.Writer, validity: []const bool
     }
 }
 
-pub fn decodeDefinitionLevels(allocator: std.mem.Allocator, data: []const u8, value_count: usize) !struct { levels: []bool, consumed: usize } {
+pub fn encodeLevels(allocator: std.mem.Allocator, writer: *std.Io.Writer, levels: []const u16, max_level: u16) !void {
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+
+    try encodeLevelsBody(&body.writer, levels, max_level);
+
+    try writer.writeInt(u32, @intCast(body.written().len), .little);
+    try writer.writeAll(body.written());
+}
+
+pub fn encodeLevelsBody(writer: *std.Io.Writer, levels: []const u16, max_level: u16) !void {
+    const bit_width = definitionLevelBitWidth(max_level);
+    if (bit_width == 0) {
+        for (levels) |level| {
+            if (level != 0) return error.InvalidColumnData;
+        }
+        return;
+    }
+
+    const width_bytes = (@as(usize, bit_width) + 7) / 8;
+    var i: usize = 0;
+    while (i < levels.len) {
+        const value = levels[i];
+        if (value > max_level) return error.InvalidColumnData;
+
+        var run_len: usize = 1;
+        while (i + run_len < levels.len and levels[i + run_len] == value) : (run_len += 1) {}
+        if (run_len > std.math.maxInt(usize) / 2) return error.RowCountOverflow;
+        try writeVarUint(writer, run_len << 1);
+
+        var b: usize = 0;
+        while (b < width_bytes) : (b += 1) {
+            try writer.writeByte(@intCast((@as(u32, value) >> @intCast(8 * b)) & 0xff));
+        }
+        i += run_len;
+    }
+}
+
+pub const DefinitionLevels = struct {
+    levels: []bool,
+    consumed: usize,
+};
+
+pub const LevelValues = struct {
+    levels: []u16,
+    consumed: usize,
+};
+
+pub const DefinitionLevelCheck = struct {
+    all_valid: bool,
+    consumed: usize,
+};
+
+pub fn decodeDefinitionLevels(allocator: std.mem.Allocator, data: []const u8, value_count: usize) !DefinitionLevels {
+    return decodeDefinitionLevelsMax(allocator, data, value_count, 1);
+}
+
+pub fn decodeDefinitionLevelsMax(allocator: std.mem.Allocator, data: []const u8, value_count: usize, max_definition_level: u16) !DefinitionLevels {
     if (data.len < 4) return error.CorruptPage;
     const len = std.mem.readInt(u32, data[0..4], .little);
     const end = std.math.add(usize, 4, @as(usize, len)) catch return error.CorruptPage;
     if (end > data.len) return error.CorruptPage;
-    const out = try decodeDefinitionLevelsBody(allocator, data[4..end], value_count);
+    const out = try decodeDefinitionLevelsBodyMax(allocator, data[4..end], value_count, max_definition_level);
     return .{ .levels = out, .consumed = end };
 }
 
+pub fn decodeDefinitionLevelsForEncoding(allocator: std.mem.Allocator, encoding: types.Encoding, data: []const u8, value_count: usize) !DefinitionLevels {
+    return decodeDefinitionLevelsForEncodingMax(allocator, encoding, data, value_count, 1);
+}
+
+pub fn decodeDefinitionLevelsForEncodingMax(allocator: std.mem.Allocator, encoding: types.Encoding, data: []const u8, value_count: usize, max_definition_level: u16) !DefinitionLevels {
+    return switch (encoding) {
+        .rle => decodeDefinitionLevelsMax(allocator, data, value_count, max_definition_level),
+        .bit_packed => decodeDefinitionLevelsBitPackedMax(allocator, data, value_count, max_definition_level),
+        else => error.UnsupportedEncoding,
+    };
+}
+
+pub fn decodeLevelsMax(allocator: std.mem.Allocator, data: []const u8, value_count: usize, max_level: u16) !LevelValues {
+    if (data.len < 4) return error.CorruptPage;
+    const len = std.mem.readInt(u32, data[0..4], .little);
+    const end = std.math.add(usize, 4, @as(usize, len)) catch return error.CorruptPage;
+    if (end > data.len) return error.CorruptPage;
+    const out = try decodeLevelsBodyMax(allocator, data[4..end], value_count, max_level);
+    return .{ .levels = out, .consumed = end };
+}
+
+pub fn decodeLevelsForEncodingMax(allocator: std.mem.Allocator, encoding: types.Encoding, data: []const u8, value_count: usize, max_level: u16) !LevelValues {
+    return switch (encoding) {
+        .rle => decodeLevelsMax(allocator, data, value_count, max_level),
+        .bit_packed => decodeLevelsBitPackedMax(allocator, data, value_count, max_level),
+        else => error.UnsupportedEncoding,
+    };
+}
+
+pub fn definitionLevelsAllValid(data: []const u8, value_count: usize) !DefinitionLevelCheck {
+    return definitionLevelsAllValidMax(data, value_count, 1);
+}
+
+pub fn definitionLevelsAllValidMax(data: []const u8, value_count: usize, max_definition_level: u16) !DefinitionLevelCheck {
+    if (data.len < 4) return error.CorruptPage;
+    const len = std.mem.readInt(u32, data[0..4], .little);
+    const end = std.math.add(usize, 4, @as(usize, len)) catch return error.CorruptPage;
+    if (end > data.len) return error.CorruptPage;
+    return .{
+        .all_valid = try definitionLevelsBodyAllValidMax(data[4..end], value_count, max_definition_level),
+        .consumed = end,
+    };
+}
+
+pub fn definitionLevelsAllValidForEncoding(encoding: types.Encoding, data: []const u8, value_count: usize) !DefinitionLevelCheck {
+    return definitionLevelsAllValidForEncodingMax(encoding, data, value_count, 1);
+}
+
+pub fn definitionLevelsAllValidForEncodingMax(encoding: types.Encoding, data: []const u8, value_count: usize, max_definition_level: u16) !DefinitionLevelCheck {
+    return switch (encoding) {
+        .rle => definitionLevelsAllValidMax(data, value_count, max_definition_level),
+        .bit_packed => definitionLevelsBitPackedAllValidMax(data, value_count, max_definition_level),
+        else => error.UnsupportedEncoding,
+    };
+}
+
 pub fn decodeDefinitionLevelsBody(allocator: std.mem.Allocator, data: []const u8, value_count: usize) ![]bool {
+    return decodeDefinitionLevelsBodyMax(allocator, data, value_count, 1);
+}
+
+pub fn decodeDefinitionLevelsBodyMax(allocator: std.mem.Allocator, data: []const u8, value_count: usize, max_definition_level: u16) ![]bool {
     var out = try allocator.alloc(bool, value_count);
     errdefer allocator.free(out);
+    if (max_definition_level == 0) {
+        if (!try levelsBodyAllEqualMax(data, value_count, 0, 0)) return error.CorruptPage;
+        @memset(out, true);
+        return out;
+    }
+
+    const bit_width = definitionLevelBitWidth(max_definition_level);
+    const width_bytes = (@as(usize, bit_width) + 7) / 8;
     var idx: usize = 0;
     var pos: usize = 0;
     const end = data.len;
@@ -43,34 +168,248 @@ pub fn decodeDefinitionLevelsBody(allocator: std.mem.Allocator, data: []const u8
         const header = try readVarUint(data, &pos, end);
         if ((header & 1) == 0) {
             const run_len = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
-            if (pos >= end) return error.CorruptPage;
-            const bit = data[pos] & 1;
-            pos += 1;
+            if (width_bytes > end - pos) return error.CorruptPage;
+            const level = readLevelValue(data[pos..][0..width_bytes]);
+            if (level > max_definition_level) return error.CorruptPage;
+            pos += width_bytes;
             if (run_len > value_count - idx) return error.CorruptPage;
-            @memset(out[idx..][0..run_len], bit != 0);
+            @memset(out[idx..][0..run_len], level == max_definition_level);
             idx += run_len;
         } else {
             const group_count = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
             const total = std.math.mul(usize, group_count, 8) catch return error.CorruptPage;
+            const bit_len = std.math.mul(usize, total, @as(usize, bit_width)) catch return error.CorruptPage;
+            const byte_len = try ceilDiv8(bit_len);
+            if (byte_len > end - pos) return error.CorruptPage;
+            const decode_count = @min(total, value_count - idx);
             var j: usize = 0;
-            while (j < total and idx < value_count) : (j += 1) {
-                if (pos >= end) return error.CorruptPage;
-                const byte = data[pos];
-                const bit = (byte >> @intCast(j & 7)) & 1;
-                out[idx] = bit != 0;
+            while (j < decode_count) : (j += 1) {
+                const level = readPackedValue(data[pos..][0..byte_len], j * @as(usize, bit_width), bit_width);
+                if (level > max_definition_level) return error.CorruptPage;
+                out[idx] = level == max_definition_level;
                 idx += 1;
-                if ((j & 7) == 7) pos += 1;
             }
-            if ((j & 7) != 0) pos += 1;
+            pos += byte_len;
         }
     }
     if (idx != value_count or pos != end) return error.CorruptPage;
     return out;
 }
 
+pub fn decodeLevelsBodyMax(allocator: std.mem.Allocator, data: []const u8, value_count: usize, max_level: u16) ![]u16 {
+    var out = try allocator.alloc(u16, value_count);
+    errdefer allocator.free(out);
+    if (data.len == 0 and max_level == 0) {
+        @memset(out, 0);
+        return out;
+    }
+
+    const bit_width = definitionLevelBitWidth(max_level);
+    const width_bytes = (@as(usize, bit_width) + 7) / 8;
+    var idx: usize = 0;
+    var pos: usize = 0;
+    const end = data.len;
+    while (pos < end and idx < value_count) {
+        const header = try readVarUint(data, &pos, end);
+        if ((header & 1) == 0) {
+            const run_len = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
+            if (width_bytes > end - pos) return error.CorruptPage;
+            const level = if (bit_width == 0) 0 else readLevelValue(data[pos..][0..width_bytes]);
+            if (level > max_level) return error.CorruptPage;
+            pos += width_bytes;
+            if (run_len > value_count - idx) return error.CorruptPage;
+            @memset(out[idx..][0..run_len], @intCast(level));
+            idx += run_len;
+        } else {
+            const group_count = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
+            const total = std.math.mul(usize, group_count, 8) catch return error.CorruptPage;
+            const bit_len = std.math.mul(usize, total, @as(usize, bit_width)) catch return error.CorruptPage;
+            const byte_len = try ceilDiv8(bit_len);
+            if (byte_len > end - pos) return error.CorruptPage;
+            const decode_count = @min(total, value_count - idx);
+            var j: usize = 0;
+            while (j < decode_count) : (j += 1) {
+                const level = if (bit_width == 0) 0 else readPackedValue(data[pos..][0..byte_len], j * @as(usize, bit_width), bit_width);
+                if (level > max_level) return error.CorruptPage;
+                out[idx] = @intCast(level);
+                idx += 1;
+            }
+            pos += byte_len;
+        }
+    }
+    if (idx != value_count or pos != end) return error.CorruptPage;
+    return out;
+}
+
+fn decodeDefinitionLevelsBitPacked(allocator: std.mem.Allocator, data: []const u8, value_count: usize) !DefinitionLevels {
+    return decodeDefinitionLevelsBitPackedMax(allocator, data, value_count, 1);
+}
+
+fn decodeDefinitionLevelsBitPackedMax(allocator: std.mem.Allocator, data: []const u8, value_count: usize, max_definition_level: u16) !DefinitionLevels {
+    const bit_width = definitionLevelBitWidth(max_definition_level);
+    const bit_len = std.math.mul(usize, value_count, @as(usize, bit_width)) catch return error.CorruptPage;
+    const byte_len = try ceilDiv8(bit_len);
+    if (byte_len > data.len) return error.CorruptPage;
+    const out = try allocator.alloc(bool, value_count);
+    errdefer allocator.free(out);
+    if (max_definition_level == 0) {
+        if (byte_len != 0) return error.CorruptPage;
+        @memset(out, true);
+        return .{ .levels = out, .consumed = 0 };
+    }
+    for (out, 0..) |*value, i| {
+        const level = readPackedValue(data[0..byte_len], i * @as(usize, bit_width), bit_width);
+        if (level > max_definition_level) return error.CorruptPage;
+        value.* = level == max_definition_level;
+    }
+    return .{ .levels = out, .consumed = byte_len };
+}
+
+fn decodeLevelsBitPackedMax(allocator: std.mem.Allocator, data: []const u8, value_count: usize, max_level: u16) !LevelValues {
+    const bit_width = definitionLevelBitWidth(max_level);
+    const bit_len = std.math.mul(usize, value_count, @as(usize, bit_width)) catch return error.CorruptPage;
+    const byte_len = try ceilDiv8(bit_len);
+    if (byte_len > data.len) return error.CorruptPage;
+    const out = try allocator.alloc(u16, value_count);
+    errdefer allocator.free(out);
+    if (max_level == 0) {
+        if (byte_len != 0) return error.CorruptPage;
+        @memset(out, 0);
+        return .{ .levels = out, .consumed = 0 };
+    }
+    for (out, 0..) |*value, i| {
+        const level = readPackedValue(data[0..byte_len], i * @as(usize, bit_width), bit_width);
+        if (level > max_level) return error.CorruptPage;
+        value.* = @intCast(level);
+    }
+    return .{ .levels = out, .consumed = byte_len };
+}
+
+fn definitionLevelsBodyAllValid(data: []const u8, value_count: usize) !bool {
+    return definitionLevelsBodyAllValidMax(data, value_count, 1);
+}
+
+fn definitionLevelsBodyAllValidMax(data: []const u8, value_count: usize, max_definition_level: u16) !bool {
+    if (max_definition_level == 0) return levelsBodyAllEqualMax(data, value_count, 0, 0);
+    const bit_width = definitionLevelBitWidth(max_definition_level);
+    const width_bytes = (@as(usize, bit_width) + 7) / 8;
+    var idx: usize = 0;
+    var pos: usize = 0;
+    const end = data.len;
+    while (pos < end and idx < value_count) {
+        const header = try readVarUint(data, &pos, end);
+        if ((header & 1) == 0) {
+            const run_len = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
+            if (width_bytes > end - pos) return error.CorruptPage;
+            const level = readLevelValue(data[pos..][0..width_bytes]);
+            if (level > max_definition_level) return error.CorruptPage;
+            pos += width_bytes;
+            if (run_len > value_count - idx) return error.CorruptPage;
+            if (level != max_definition_level) return false;
+            idx += run_len;
+        } else {
+            const group_count = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
+            const total = std.math.mul(usize, group_count, 8) catch return error.CorruptPage;
+            const bit_len = std.math.mul(usize, total, @as(usize, bit_width)) catch return error.CorruptPage;
+            const byte_len = try ceilDiv8(bit_len);
+            if (byte_len > end - pos) return error.CorruptPage;
+            const decode_count = @min(total, value_count - idx);
+            var j: usize = 0;
+            while (j < decode_count) : (j += 1) {
+                const level = readPackedValue(data[pos..][0..byte_len], j * @as(usize, bit_width), bit_width);
+                if (level > max_definition_level) return error.CorruptPage;
+                if (level != max_definition_level) return false;
+                idx += 1;
+            }
+            pos += byte_len;
+        }
+    }
+    if (idx != value_count or pos != end) return error.CorruptPage;
+    return true;
+}
+
+pub fn levelsBodyAllEqualMax(data: []const u8, value_count: usize, max_level: u16, expected_level: u16) !bool {
+    if (expected_level > max_level) return error.CorruptPage;
+    if (data.len == 0 and max_level == 0) return expected_level == 0;
+
+    const bit_width = definitionLevelBitWidth(max_level);
+    const width_bytes = (@as(usize, bit_width) + 7) / 8;
+    var idx: usize = 0;
+    var pos: usize = 0;
+    const end = data.len;
+    while (pos < end and idx < value_count) {
+        const header = try readVarUint(data, &pos, end);
+        if ((header & 1) == 0) {
+            const run_len = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
+            if (width_bytes > end - pos) return error.CorruptPage;
+            const level = if (bit_width == 0) 0 else readLevelValue(data[pos..][0..width_bytes]);
+            if (level > max_level) return error.CorruptPage;
+            pos += width_bytes;
+            if (run_len > value_count - idx) return error.CorruptPage;
+            if (level != expected_level) return false;
+            idx += run_len;
+        } else {
+            const group_count = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
+            const total = std.math.mul(usize, group_count, 8) catch return error.CorruptPage;
+            const bit_len = std.math.mul(usize, total, @as(usize, bit_width)) catch return error.CorruptPage;
+            const byte_len = try ceilDiv8(bit_len);
+            if (byte_len > end - pos) return error.CorruptPage;
+            const decode_count = @min(total, value_count - idx);
+            if (bit_width == 0) {
+                if (expected_level != 0) return false;
+                idx += decode_count;
+            } else {
+                var j: usize = 0;
+                while (j < decode_count) : (j += 1) {
+                    const level = readPackedValue(data[pos..][0..byte_len], j * @as(usize, bit_width), bit_width);
+                    if (level > max_level) return error.CorruptPage;
+                    if (level != expected_level) return false;
+                    idx += 1;
+                }
+            }
+            pos += byte_len;
+        }
+    }
+    if (idx != value_count or pos != end) return error.CorruptPage;
+    return true;
+}
+
+fn definitionLevelsBitPackedAllValid(data: []const u8, value_count: usize) !DefinitionLevelCheck {
+    return definitionLevelsBitPackedAllValidMax(data, value_count, 1);
+}
+
+fn definitionLevelsBitPackedAllValidMax(data: []const u8, value_count: usize, max_definition_level: u16) !DefinitionLevelCheck {
+    const bit_width = definitionLevelBitWidth(max_definition_level);
+    const bit_len = std.math.mul(usize, value_count, @as(usize, bit_width)) catch return error.CorruptPage;
+    const byte_len = try ceilDiv8(bit_len);
+    if (byte_len > data.len) return error.CorruptPage;
+    if (max_definition_level == 0) return .{ .all_valid = byte_len == 0, .consumed = byte_len };
+    var i: usize = 0;
+    while (i < value_count) : (i += 1) {
+        const level = readPackedValue(data[0..byte_len], i * @as(usize, bit_width), bit_width);
+        if (level > max_definition_level) return error.CorruptPage;
+        if (level != max_definition_level) return .{ .all_valid = false, .consumed = byte_len };
+    }
+    return .{ .all_valid = true, .consumed = byte_len };
+}
+
+fn definitionLevelBitWidth(max_definition_level: u16) u8 {
+    if (max_definition_level == 0) return 0;
+    if (max_definition_level == 1) return 1;
+    return @intCast(16 - @clz(max_definition_level));
+}
+
+fn readLevelValue(data: []const u8) u32 {
+    var value: u32 = 0;
+    for (data, 0..) |byte, i| {
+        value |= @as(u32, byte) << @intCast(i * 8);
+    }
+    return value;
+}
+
 pub fn encodeValues(writer: *std.Io.Writer, data: types.ColumnData, column_type: types.ColumnType) !void {
     const fixed_width = switch (data) {
-        .fixed_len_byte_array => try types.physicalTypeWidth(column_type.physical, column_type.type_length),
+        .int96, .fixed_len_byte_array => try types.physicalTypeWidth(column_type.physical, column_type.type_length),
         else => 0,
     };
 
@@ -78,6 +417,10 @@ pub fn encodeValues(writer: *std.Io.Writer, data: types.ColumnData, column_type:
         .boolean => |d| try encodeBooleans(writer, d.values),
         .int32 => |d| for (d.values) |value| try writer.writeInt(i32, value, .little),
         .int64 => |d| for (d.values) |value| try writer.writeInt(i64, value, .little),
+        .int96 => |d| for (d.values) |value| {
+            if (value.len != fixed_width) return error.InvalidColumnData;
+            try writer.writeAll(value);
+        },
         .float => |d| for (d.values) |value| try writer.writeInt(u32, @bitCast(value), .little),
         .double => |d| for (d.values) |value| try writer.writeInt(u64, @bitCast(value), .little),
         .byte_array => |d| for (d.values) |value| {
@@ -157,11 +500,11 @@ pub fn decodeValues(
         .boolean => .{ .boolean = try decodeBooleans(allocator, non_null_count, validity, data) },
         .int32 => .{ .int32 = try decodeFixed(i32, allocator, non_null_count, validity, data) },
         .int64 => .{ .int64 = try decodeFixed(i64, allocator, non_null_count, validity, data) },
+        .int96 => .{ .int96 = try decodeFixedLenByteArrays(allocator, non_null_count, validity, data, try types.physicalTypeWidth(column_type.physical, column_type.type_length)) },
         .float => .{ .float = try decodeFloats(allocator, non_null_count, validity, data) },
         .double => .{ .double = try decodeDoubles(allocator, non_null_count, validity, data) },
         .byte_array => .{ .byte_array = try decodeByteArrays(allocator, non_null_count, validity, data) },
         .fixed_len_byte_array => .{ .fixed_len_byte_array = try decodeFixedLenByteArrays(allocator, non_null_count, validity, data, try types.physicalTypeWidth(column_type.physical, column_type.type_length)) },
-        else => error.UnsupportedType,
     };
 }
 
@@ -304,6 +647,25 @@ pub fn decodeRleBitPackedUint32(allocator: std.mem.Allocator, data: []const u8, 
     return values;
 }
 
+pub fn decodeBitPackedUint32(allocator: std.mem.Allocator, data: []const u8, bit_width: u8, count: usize) ![]u32 {
+    if (bit_width > 32) return error.CorruptPage;
+    const values = try allocator.alloc(u32, count);
+    errdefer allocator.free(values);
+    if (bit_width == 0) {
+        @memset(values, 0);
+        if (data.len != 0) return error.CorruptPage;
+        return values;
+    }
+
+    const bit_len = std.math.mul(usize, count, @as(usize, bit_width)) catch return error.CorruptPage;
+    const byte_len = try ceilDiv8(bit_len);
+    if (byte_len != data.len) return error.CorruptPage;
+    if (!decodePackedRunFast(values, data, bit_width)) {
+        for (values, 0..) |*value, i| value.* = readPackedValue(data, i * @as(usize, bit_width), bit_width);
+    }
+    return values;
+}
+
 pub fn rleBitPackedUint32Identity(data: []const u8, bit_width: u8, count: usize) !bool {
     return rleBitPackedUint32IdentityFrom(data, bit_width, count, 0);
 }
@@ -401,38 +763,77 @@ fn packedRunIsIdentity(data: []const u8, bit_width: u8, start: usize, count: usi
             return true;
         },
         8 => {
-            for (data[0..count], 0..) |value, i| {
-                const expected = std.math.cast(u32, start + i) orelse return false;
+            if (start + count > 1 << 8) return false;
+            var expected: u32 = @intCast(start);
+            for (data[0..count]) |value| {
                 if (value != expected) return false;
+                expected += 1;
             }
             return true;
         },
         16 => {
+            if (start + count > 1 << 16) return false;
+            if (native_endian == .little and count >= 8) {
+                const Vec = @Vector(8, u16);
+                const step: Vec = @splat(8);
+                var expected_vec: Vec = .{
+                    @intCast(start + 0),
+                    @intCast(start + 1),
+                    @intCast(start + 2),
+                    @intCast(start + 3),
+                    @intCast(start + 4),
+                    @intCast(start + 5),
+                    @intCast(start + 6),
+                    @intCast(start + 7),
+                };
+                var i: usize = 0;
+                while (i + 8 <= count) : (i += 8) {
+                    const offset = i * 2;
+                    const bytes: [16]u8 = data[offset..][0..16].*;
+                    const values: Vec = @bitCast(bytes);
+                    if (@reduce(.Or, values != expected_vec)) return false;
+                    expected_vec += step;
+                }
+                var expected: u32 = @intCast(start + i);
+                while (i < count) : (i += 1) {
+                    const offset = i * 2;
+                    const value = @as(u32, data[offset]) |
+                        (@as(u32, data[offset + 1]) << 8);
+                    if (value != expected) return false;
+                    expected += 1;
+                }
+                return true;
+            }
+            var expected: u32 = @intCast(start);
             for (0..count) |i| {
                 const offset = i * 2;
                 const value = @as(u32, data[offset]) |
                     (@as(u32, data[offset + 1]) << 8);
-                const expected = std.math.cast(u32, start + i) orelse return false;
                 if (value != expected) return false;
+                expected += 1;
             }
             return true;
         },
         24 => {
+            if (start + count > 1 << 24) return false;
+            var expected: u32 = @intCast(start);
             for (0..count) |i| {
                 const offset = i * 3;
                 const value = @as(u32, data[offset]) |
                     (@as(u32, data[offset + 1]) << 8) |
                     (@as(u32, data[offset + 2]) << 16);
-                const expected = std.math.cast(u32, start + i) orelse return false;
                 if (value != expected) return false;
+                expected += 1;
             }
             return true;
         },
         32 => {
+            if (start + count > @as(usize, std.math.maxInt(u32)) + 1) return false;
+            var expected: u32 = @intCast(start);
             for (0..count) |i| {
                 const value = std.mem.readInt(u32, data[i * 4 ..][0..4], .little);
-                const expected = std.math.cast(u32, start + i) orelse return false;
                 if (value != expected) return false;
+                expected +%= 1;
             }
             return true;
         },
@@ -539,6 +940,28 @@ pub fn materializeDictionary(
             },
             else => error.CorruptPage,
         },
+        .int96 => switch (dictionary.*) {
+            .int96 => |dict| blk: {
+                var total: usize = 0;
+                for (indexes) |idx| {
+                    if (idx >= dict.values.len) return error.CorruptPage;
+                    total += dict.values[idx].len;
+                }
+                const bytes = try allocator.alloc(u8, total);
+                errdefer allocator.free(bytes);
+                const values = try allocator.alloc([]const u8, indexes.len);
+                errdefer allocator.free(values);
+                var pos: usize = 0;
+                for (indexes, values) |idx, *value| {
+                    const src = dict.values[idx];
+                    @memcpy(bytes[pos..][0..src.len], src);
+                    value.* = bytes[pos..][0..src.len];
+                    pos += src.len;
+                }
+                break :blk .{ .int96 = .{ .values = values, .data = bytes, .validity = validity } };
+            },
+            else => error.CorruptPage,
+        },
         .fixed_len_byte_array => switch (dictionary.*) {
             .fixed_len_byte_array => |dict| blk: {
                 var total: usize = 0;
@@ -561,7 +984,6 @@ pub fn materializeDictionary(
             },
             else => error.CorruptPage,
         },
-        else => error.UnsupportedType,
     };
 }
 
@@ -810,17 +1232,60 @@ fn decodeByteStreamSplitInts(comptime T: type, allocator: std.mem.Allocator, cou
     i64 => types.OwnedInt64,
     else => unreachable,
 } {
-    const width = @sizeOf(T);
-    const bytes = std.math.mul(usize, width, count) catch return error.CorruptPage;
-    if (data.len < bytes) return error.CorruptPage;
     const values = try allocator.alloc(T, count);
     errdefer allocator.free(values);
-    for (values, 0..) |*value, idx| {
-        var raw: [width]u8 = undefined;
-        for (&raw, 0..) |*byte, byte_idx| byte.* = data[byte_idx * count + idx];
-        value.* = std.mem.readInt(T, raw[0..width], .little);
-    }
+    try decodeByteStreamSplitIntsInto(T, values, data);
     return .{ .values = values, .validity = validity };
+}
+
+pub fn decodeByteStreamSplitIntsInto(comptime T: type, values: []T, data: []const u8) !void {
+    const width = @sizeOf(T);
+    const count = values.len;
+    const bytes = std.math.mul(usize, width, count) catch return error.CorruptPage;
+    if (data.len < bytes) return error.CorruptPage;
+    switch (width) {
+        4 => {
+            const b0 = data[0 * count ..][0..count];
+            const b1 = data[1 * count ..][0..count];
+            const b2 = data[2 * count ..][0..count];
+            const b3 = data[3 * count ..][0..count];
+            for (values, 0..) |*value, idx| {
+                const bits = @as(u32, b0[idx]) |
+                    (@as(u32, b1[idx]) << 8) |
+                    (@as(u32, b2[idx]) << 16) |
+                    (@as(u32, b3[idx]) << 24);
+                value.* = @bitCast(bits);
+            }
+        },
+        8 => {
+            const b0 = data[0 * count ..][0..count];
+            const b1 = data[1 * count ..][0..count];
+            const b2 = data[2 * count ..][0..count];
+            const b3 = data[3 * count ..][0..count];
+            const b4 = data[4 * count ..][0..count];
+            const b5 = data[5 * count ..][0..count];
+            const b6 = data[6 * count ..][0..count];
+            const b7 = data[7 * count ..][0..count];
+            for (values, 0..) |*value, idx| {
+                const bits = @as(u64, b0[idx]) |
+                    (@as(u64, b1[idx]) << 8) |
+                    (@as(u64, b2[idx]) << 16) |
+                    (@as(u64, b3[idx]) << 24) |
+                    (@as(u64, b4[idx]) << 32) |
+                    (@as(u64, b5[idx]) << 40) |
+                    (@as(u64, b6[idx]) << 48) |
+                    (@as(u64, b7[idx]) << 56);
+                value.* = @bitCast(bits);
+            }
+        },
+        else => {
+            for (values, 0..) |*value, idx| {
+                var raw: [width]u8 = undefined;
+                for (&raw, 0..) |*byte, byte_idx| byte.* = data[byte_idx * count + idx];
+                value.* = std.mem.readInt(T, raw[0..width], .little);
+            }
+        },
+    }
 }
 
 fn decodeByteStreamSplitFloats(comptime T: type, allocator: std.mem.Allocator, count: usize, validity: ?[]bool, data: []const u8) !switch (T) {
@@ -828,18 +1293,61 @@ fn decodeByteStreamSplitFloats(comptime T: type, allocator: std.mem.Allocator, c
     f64 => types.OwnedDouble,
     else => unreachable,
 } {
-    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
-    const width = @sizeOf(T);
-    const bytes = std.math.mul(usize, width, count) catch return error.CorruptPage;
-    if (data.len < bytes) return error.CorruptPage;
     const values = try allocator.alloc(T, count);
     errdefer allocator.free(values);
-    for (values, 0..) |*value, idx| {
-        var raw: [width]u8 = undefined;
-        for (&raw, 0..) |*byte, byte_idx| byte.* = data[byte_idx * count + idx];
-        value.* = @bitCast(std.mem.readInt(U, raw[0..width], .little));
-    }
+    try decodeByteStreamSplitFloatsInto(T, values, data);
     return .{ .values = values, .validity = validity };
+}
+
+pub fn decodeByteStreamSplitFloatsInto(comptime T: type, values: []T, data: []const u8) !void {
+    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const width = @sizeOf(T);
+    const count = values.len;
+    const bytes = std.math.mul(usize, width, count) catch return error.CorruptPage;
+    if (data.len < bytes) return error.CorruptPage;
+    switch (width) {
+        4 => {
+            const b0 = data[0 * count ..][0..count];
+            const b1 = data[1 * count ..][0..count];
+            const b2 = data[2 * count ..][0..count];
+            const b3 = data[3 * count ..][0..count];
+            for (values, 0..) |*value, idx| {
+                const bits = @as(u32, b0[idx]) |
+                    (@as(u32, b1[idx]) << 8) |
+                    (@as(u32, b2[idx]) << 16) |
+                    (@as(u32, b3[idx]) << 24);
+                value.* = @bitCast(bits);
+            }
+        },
+        8 => {
+            const b0 = data[0 * count ..][0..count];
+            const b1 = data[1 * count ..][0..count];
+            const b2 = data[2 * count ..][0..count];
+            const b3 = data[3 * count ..][0..count];
+            const b4 = data[4 * count ..][0..count];
+            const b5 = data[5 * count ..][0..count];
+            const b6 = data[6 * count ..][0..count];
+            const b7 = data[7 * count ..][0..count];
+            for (values, 0..) |*value, idx| {
+                const bits = @as(u64, b0[idx]) |
+                    (@as(u64, b1[idx]) << 8) |
+                    (@as(u64, b2[idx]) << 16) |
+                    (@as(u64, b3[idx]) << 24) |
+                    (@as(u64, b4[idx]) << 32) |
+                    (@as(u64, b5[idx]) << 40) |
+                    (@as(u64, b6[idx]) << 48) |
+                    (@as(u64, b7[idx]) << 56);
+                value.* = @bitCast(bits);
+            }
+        },
+        else => {
+            for (values, 0..) |*value, idx| {
+                var raw: [width]u8 = undefined;
+                for (&raw, 0..) |*byte, byte_idx| byte.* = data[byte_idx * count + idx];
+                value.* = @bitCast(std.mem.readInt(U, raw[0..width], .little));
+            }
+        },
+    }
 }
 
 fn decodeByteStreamSplitFixedLenByteArrays(allocator: std.mem.Allocator, count: usize, validity: ?[]bool, data: []const u8, width: usize) !types.OwnedByteArray {
@@ -869,15 +1377,36 @@ fn decodeDeltaBinaryPackedInts(comptime T: type, allocator: std.mem.Allocator, c
     i64 => types.OwnedInt64,
     else => unreachable,
 } {
-    const decoded = try decodeDeltaBinaryPackedIntSlice(T, allocator, count, data);
+    const decoded = try decodeDeltaBinaryPackedIntSliceMode(T, allocator, count, data, .padded_if_present);
     errdefer allocator.free(decoded.values);
     if (decoded.consumed != data.len) return error.CorruptPage;
     return .{ .values = decoded.values, .validity = validity };
 }
 
 fn decodeDeltaBinaryPackedIntSlice(comptime T: type, allocator: std.mem.Allocator, count: usize, data: []const u8) !struct { values: []T, consumed: usize } {
+    return decodeDeltaBinaryPackedIntSliceMode(T, allocator, count, data, .padded_if_present);
+}
+
+const DeltaFinalMiniblockMode = enum {
+    compact,
+    padded_if_present,
+};
+
+const delta_final_miniblock_modes = [_]DeltaFinalMiniblockMode{ .padded_if_present, .compact };
+
+fn decodeDeltaBinaryPackedIntSliceMode(comptime T: type, allocator: std.mem.Allocator, count: usize, data: []const u8, final_mode: DeltaFinalMiniblockMode) !struct { values: []T, consumed: usize } {
     const values = try allocator.alloc(T, count);
     errdefer allocator.free(values);
+    const consumed = try decodeDeltaBinaryPackedIntsIntoMode(T, values, data, final_mode);
+    return .{ .values = values, .consumed = consumed };
+}
+
+pub fn decodeDeltaBinaryPackedIntsInto(comptime T: type, values: []T, data: []const u8) !usize {
+    return decodeDeltaBinaryPackedIntsIntoMode(T, values, data, .padded_if_present);
+}
+
+fn decodeDeltaBinaryPackedIntsIntoMode(comptime T: type, values: []T, data: []const u8, final_mode: DeltaFinalMiniblockMode) !usize {
+    const count = values.len;
     if (count == 0) {
         var pos: usize = 0;
         const block_size = std.math.cast(usize, try readVarUint(data, &pos, data.len)) orelse return error.CorruptPage;
@@ -888,7 +1417,10 @@ fn decodeDeltaBinaryPackedIntSlice(comptime T: type, allocator: std.mem.Allocato
         const miniblock_values = block_size / miniblocks_per_block;
         if (miniblock_values == 0 or miniblock_values % 32 != 0) return error.CorruptPage;
         if (total_value_count != 0) return error.CorruptPage;
-        return .{ .values = values, .consumed = pos };
+        if (final_mode == .padded_if_present and pos < data.len) {
+            _ = try readZigZagInt(i64, data, &pos);
+        }
+        return pos;
     }
 
     var pos: usize = 0;
@@ -901,36 +1433,61 @@ fn decodeDeltaBinaryPackedIntSlice(comptime T: type, allocator: std.mem.Allocato
     if (miniblock_values == 0 or miniblock_values % 32 != 0) return error.CorruptPage;
     if (total_value_count != count) return error.CorruptPage;
 
-    var previous = try readZigZagInt(i64, data, &pos);
-    values[0] = std.math.cast(T, previous) orelse return error.CorruptPage;
+    var previous = std.math.cast(T, try readZigZagInt(i64, data, &pos)) orelse return error.CorruptPage;
+    values[0] = previous;
     var value_idx: usize = 1;
     while (value_idx < count) {
-        const min_delta = try readZigZagInt(i64, data, &pos);
+        const min_delta = std.math.cast(T, try readZigZagInt(i64, data, &pos)) orelse return error.CorruptPage;
         if (data.len - pos < miniblocks_per_block) return error.CorruptPage;
         const bit_widths = data[pos..][0..miniblocks_per_block];
         pos += miniblocks_per_block;
 
         for (bit_widths) |bit_width| {
+            if (value_idx >= count) continue;
             if (bit_width > 64) return error.CorruptPage;
-            const bits = std.math.mul(usize, miniblock_values, bit_width) catch return error.CorruptPage;
-            const bytes = try ceilDiv8(bits);
+            const values_in_miniblock = @min(miniblock_values, count - value_idx);
+            const actual_bits = std.math.mul(usize, values_in_miniblock, bit_width) catch return error.CorruptPage;
+            const actual_bytes = try ceilDiv8(actual_bits);
+            const full_bits = std.math.mul(usize, miniblock_values, bit_width) catch return error.CorruptPage;
+            const full_bytes = try ceilDiv8(full_bits);
+            const bytes = switch (final_mode) {
+                .compact => actual_bytes,
+                .padded_if_present => if (values_in_miniblock < miniblock_values and full_bytes > data.len - pos)
+                    actual_bytes
+                else
+                    full_bytes,
+            };
             if (bytes > data.len - pos) return error.CorruptPage;
             const packed_bytes = data[pos..][0..bytes];
             pos += bytes;
 
             var mini_idx: usize = 0;
-            while (mini_idx < miniblock_values and value_idx < count) : (mini_idx += 1) {
+            while (mini_idx < values_in_miniblock) : (mini_idx += 1) {
                 const raw_delta = readPackedValue64(packed_bytes, mini_idx * @as(usize, bit_width), bit_width);
-                const adjusted = std.math.cast(i64, raw_delta) orelse return error.CorruptPage;
-                const delta = std.math.add(i64, min_delta, adjusted) catch return error.CorruptPage;
-                previous = std.math.add(i64, previous, delta) catch return error.CorruptPage;
-                values[value_idx] = std.math.cast(T, previous) orelse return error.CorruptPage;
+                const adjusted = try deltaPackedValue(T, raw_delta, bit_width);
+                const delta = min_delta +% adjusted;
+                previous +%= delta;
+                values[value_idx] = previous;
                 value_idx += 1;
             }
         }
     }
 
-    return .{ .values = values, .consumed = pos };
+    return pos;
+}
+
+fn deltaPackedValue(comptime T: type, raw: u64, bit_width: u8) !T {
+    return switch (T) {
+        i32 => blk: {
+            if (bit_width == 32) break :blk @as(i32, @bitCast(@as(u32, @intCast(raw))));
+            break :blk std.math.cast(i32, raw) orelse return error.CorruptPage;
+        },
+        i64 => blk: {
+            if (bit_width == 64) break :blk @as(i64, @bitCast(raw));
+            break :blk std.math.cast(i64, raw) orelse return error.CorruptPage;
+        },
+        else => unreachable,
+    };
 }
 
 const ByteRange = struct {
@@ -939,17 +1496,23 @@ const ByteRange = struct {
 };
 
 fn decodeDeltaLengthByteArrays(allocator: std.mem.Allocator, count: usize, validity: ?[]bool, data: []const u8) !types.OwnedByteArray {
-    const decoded = try decodeDeltaLengthByteArraysInternal(allocator, count, validity, data);
-    if (decoded.consumed != data.len) {
+    var last_error: anyerror = error.CorruptPage;
+    for (delta_final_miniblock_modes) |mode| {
+        const decoded = decodeDeltaLengthByteArraysInternalMode(allocator, count, validity, data, mode) catch |err| {
+            last_error = err;
+            continue;
+        };
+        if (decoded.consumed == data.len) return decoded.column;
         var column = decoded.column;
+        column.validity = null;
         column.deinit(allocator);
-        return error.CorruptPage;
+        last_error = error.CorruptPage;
     }
-    return decoded.column;
+    return last_error;
 }
 
-fn decodeDeltaLengthByteArraysInternal(allocator: std.mem.Allocator, count: usize, validity: ?[]bool, data: []const u8) !struct { column: types.OwnedByteArray, consumed: usize } {
-    const lengths = try decodeDeltaBinaryPackedIntSlice(i32, allocator, count, data);
+fn decodeDeltaLengthByteArraysInternalMode(allocator: std.mem.Allocator, count: usize, validity: ?[]bool, data: []const u8, final_mode: DeltaFinalMiniblockMode) !struct { column: types.OwnedByteArray, consumed: usize } {
+    const lengths = try decodeDeltaBinaryPackedIntSliceMode(i32, allocator, count, data, final_mode);
     defer allocator.free(lengths.values);
 
     var total: usize = 0;
@@ -982,33 +1545,54 @@ fn decodeDeltaLengthByteArraysInternal(allocator: std.mem.Allocator, count: usiz
 }
 
 fn decodeDeltaByteArrays(allocator: std.mem.Allocator, count: usize, validity: ?[]bool, data: []const u8, fixed_width: ?usize) !types.OwnedByteArray {
-    const prefixes = try decodeDeltaBinaryPackedIntSlice(i32, allocator, count, data);
-    defer allocator.free(prefixes.values);
+    var last_error: anyerror = error.CorruptPage;
+    for (delta_final_miniblock_modes) |prefix_mode| {
+        const prefixes = decodeDeltaBinaryPackedIntSliceMode(i32, allocator, count, data, prefix_mode) catch |err| {
+            last_error = err;
+            continue;
+        };
+        defer allocator.free(prefixes.values);
 
-    const suffixes = try decodeDeltaLengthByteArraysInternal(allocator, count, null, data[prefixes.consumed..]);
-    var suffix_column = suffixes.column;
-    defer suffix_column.deinit(allocator);
-    if (prefixes.consumed + suffixes.consumed != data.len) return error.CorruptPage;
+        for (delta_final_miniblock_modes) |suffix_mode| {
+            const suffixes = decodeDeltaLengthByteArraysInternalMode(allocator, count, null, data[prefixes.consumed..], suffix_mode) catch |err| {
+                last_error = err;
+                continue;
+            };
+            var suffix_column = suffixes.column;
+            defer suffix_column.deinit(allocator);
+            if (prefixes.consumed + suffixes.consumed != data.len) {
+                last_error = error.CorruptPage;
+                continue;
+            }
+            return assembleDeltaByteArrays(allocator, count, validity, prefixes.values, suffix_column.values, fixed_width);
+        }
+    }
+    return last_error;
+}
 
+fn assembleDeltaByteArrays(allocator: std.mem.Allocator, count: usize, validity: ?[]bool, prefixes: []const i32, suffixes: []const []const u8, fixed_width: ?usize) !types.OwnedByteArray {
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(allocator);
     const ranges = try allocator.alloc(ByteRange, count);
     defer allocator.free(ranges);
 
-    var previous: []const u8 = "";
-    for (prefixes.values, suffix_column.values, ranges) |prefix_len_i32, suffix, *range| {
+    var previous_start: usize = 0;
+    var previous_len: usize = 0;
+    for (prefixes, suffixes, ranges) |prefix_len_i32, suffix, *range| {
         if (prefix_len_i32 < 0) return error.CorruptPage;
         const prefix_len: usize = @intCast(prefix_len_i32);
-        if (prefix_len > previous.len) return error.CorruptPage;
+        if (prefix_len > previous_len) return error.CorruptPage;
         const start = bytes.items.len;
-        try bytes.appendSlice(allocator, previous[0..prefix_len]);
-        try bytes.appendSlice(allocator, suffix);
+        try bytes.ensureUnusedCapacity(allocator, prefix_len + suffix.len);
+        bytes.appendSliceAssumeCapacity(bytes.items[previous_start..][0..prefix_len]);
+        bytes.appendSliceAssumeCapacity(suffix);
         const width = bytes.items.len - start;
         if (fixed_width) |expected| {
             if (width != expected) return error.CorruptPage;
         }
         range.* = .{ .start = start, .len = width };
-        previous = bytes.items[start..][0..width];
+        previous_start = start;
+        previous_len = width;
     }
 
     const owned_bytes = try bytes.toOwnedSlice(allocator);
@@ -1144,6 +1728,57 @@ test "definition levels round-trip rle runs" {
     const decoded = try decodeDefinitionLevels(testing.allocator, out.written(), validity.len);
     defer testing.allocator.free(decoded.levels);
     try testing.expectEqualSlices(bool, validity[0..], decoded.levels);
+
+    const all_valid = [_]bool{ true, true, true, true, true, true };
+    var valid_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer valid_out.deinit();
+    try encodeDefinitionLevels(testing.allocator, &valid_out.writer, all_valid[0..]);
+    const valid_check = try definitionLevelsAllValid(valid_out.written(), all_valid.len);
+    try testing.expect(valid_check.all_valid);
+    try testing.expectEqual(valid_out.written().len, valid_check.consumed);
+
+    const mixed_check = try definitionLevelsAllValid(out.written(), validity.len);
+    try testing.expect(!mixed_check.all_valid);
+}
+
+test "definition levels decode legacy bit-packed body" {
+    const testing = std.testing;
+    const bytes = [_]u8{ 0b1010_1101, 0b0000_0011, 0xff };
+    const decoded = try decodeDefinitionLevelsForEncoding(testing.allocator, .bit_packed, &bytes, 10);
+    defer testing.allocator.free(decoded.levels);
+
+    try testing.expectEqual(@as(usize, 2), decoded.consumed);
+    try testing.expectEqualSlices(bool, &[_]bool{
+        true,
+        false,
+        true,
+        true,
+        false,
+        true,
+        false,
+        true,
+        true,
+        true,
+    }, decoded.levels);
+
+    const valid = try definitionLevelsAllValidForEncoding(.bit_packed, &[_]u8{ 0xff, 0x03 }, 10);
+    try testing.expect(valid.all_valid);
+    try testing.expectEqual(@as(usize, 2), valid.consumed);
+
+    const mixed = try definitionLevelsAllValidForEncoding(.bit_packed, &bytes, 10);
+    try testing.expect(!mixed.all_valid);
+    try testing.expectEqual(@as(usize, 2), mixed.consumed);
+}
+
+test "decode legacy pure bit-packed uint32 values" {
+    const testing = std.testing;
+    const decoded = try decodeBitPackedUint32(testing.allocator, &[_]u8{0xe4}, 2, 4);
+    defer testing.allocator.free(decoded);
+    try testing.expectEqualSlices(u32, &[_]u32{ 0, 1, 2, 3 }, decoded);
+
+    const zeros = try decodeBitPackedUint32(testing.allocator, "", 0, 3);
+    defer testing.allocator.free(zeros);
+    try testing.expectEqualSlices(u32, &[_]u32{ 0, 0, 0 }, zeros);
 }
 
 test "byte stream split round-trips fixed width values" {
@@ -1180,6 +1815,16 @@ test "boolean rle values round-trip" {
     for (values, decoded) |expected, actual| {
         try testing.expectEqual(expected, actual != 0);
     }
+}
+
+test "zero-width levels accept explicit RLE run" {
+    const testing = std.testing;
+    const body = [_]u8{ 0x88, 0x01 };
+    try testing.expect(try levelsBodyAllEqualMax(body[0..], 68, 0, 0));
+
+    const levels = try decodeDefinitionLevelsBodyMax(testing.allocator, body[0..], 68, 0);
+    defer testing.allocator.free(levels);
+    for (levels) |level| try testing.expect(level);
 }
 
 test "bit-packed dictionary indexes decode byte-aligned run" {
@@ -1245,6 +1890,47 @@ test "delta binary packed round-trips integer values" {
     try testing.expectEqual(@as(usize, 0), empty_decoded.int32.values.len);
 }
 
+test "delta binary packed decodes compact and padded final miniblocks" {
+    const testing = std.testing;
+    const expected = [_]i64{ 0, 1, 3, 6 };
+    const compact = [_]u8{
+        0x80, 0x01, // block size: 128
+        0x04, // miniblocks per block
+        0x04, // total value count
+        0x00, // first value
+        0x02, // min delta: 1
+        0x02, 0xff, 0xff, 0xff, // first miniblock bit width plus arbitrary trailing widths
+        0x24, // adjusted deltas 0, 1, 2 packed into one compact byte
+    };
+    const padded = compact ++ [_]u8{ 0, 0, 0, 0, 0, 0, 0 };
+
+    var compact_decoded = try decodeDeltaBinaryPackedValues(testing.allocator, .{ .physical = .int64 }, expected.len, expected.len, null, compact[0..]);
+    defer compact_decoded.deinit(testing.allocator);
+    try testing.expectEqualSlices(i64, expected[0..], compact_decoded.int64.values);
+
+    var padded_decoded = try decodeDeltaBinaryPackedValues(testing.allocator, .{ .physical = .int64 }, expected.len, expected.len, null, padded[0..]);
+    defer padded_decoded.deinit(testing.allocator);
+    try testing.expectEqualSlices(i64, expected[0..], padded_decoded.int64.values);
+}
+
+test "delta binary packed decodes wrapping int64 deltas" {
+    const testing = std.testing;
+    const expected = [_]i64{ std.math.minInt(i64), std.math.maxInt(i64) };
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeVarUint(&out.writer, 128);
+    try writeVarUint(&out.writer, 4);
+    try writeVarUint(&out.writer, expected.len);
+    try writeZigZagInt(&out.writer, expected[0]);
+    try writeZigZagInt(&out.writer, -1);
+    try out.writer.writeAll(&.{ 0, 0, 0, 0 });
+
+    var decoded = try decodeDeltaBinaryPackedValues(testing.allocator, .{ .physical = .int64 }, expected.len, expected.len, null, out.written());
+    defer decoded.deinit(testing.allocator);
+    try testing.expectEqualSlices(i64, expected[0..], decoded.int64.values);
+}
+
 test "delta byte array encodings round-trip byte arrays" {
     const testing = std.testing;
     const values = [_][]const u8{
@@ -1285,4 +1971,12 @@ test "delta byte array encodings round-trip byte arrays" {
     for (fixed, fixed_decoded.fixed_len_byte_array.values) |expected, actual| {
         try testing.expectEqualStrings(expected, actual);
     }
+
+    const empty_delta_header = [_]u8{ 0x80, 0x01, 0x04, 0x00, 0x00 };
+    const all_null_payload = empty_delta_header ++ empty_delta_header;
+    const all_null_validity = [_]bool{ false, false, false };
+    var all_null_decoded = try decodeDeltaByteArrayValues(testing.allocator, .{ .physical = .byte_array }, all_null_validity.len, 0, try testing.allocator.dupe(bool, all_null_validity[0..]), all_null_payload[0..]);
+    defer all_null_decoded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), all_null_decoded.byte_array.values.len);
+    try testing.expectEqualSlices(bool, all_null_validity[0..], all_null_decoded.byte_array.validity.?);
 }

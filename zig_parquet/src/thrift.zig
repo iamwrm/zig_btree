@@ -483,9 +483,12 @@ pub fn writeFileMetaData(writer: *std.Io.Writer, metadata: types.FileMetaData) !
     try cw.beginStruct();
     try cw.fieldI32(1, metadata.version);
 
-    try cw.fieldListBegin(2, .struct_, metadata.schema.columns.len + 1);
+    try cw.fieldListBegin(2, .struct_, schemaElementCount(metadata.schema));
     try writeSchemaRoot(&cw, metadata.schema);
-    for (metadata.schema.columns) |column| try writeSchemaColumn(&cw, column);
+    var schema_column_index: usize = 0;
+    while (schema_column_index < metadata.schema.columns.len) {
+        schema_column_index += try writeSchemaColumn(&cw, metadata.schema.columns, schema_column_index);
+    }
 
     try cw.fieldI64(3, metadata.num_rows);
 
@@ -510,17 +513,336 @@ fn writeTypeDefinedColumnOrder(cw: *CompactWriter) !void {
 fn writeSchemaRoot(cw: *CompactWriter, schema: types.Schema) !void {
     try cw.beginStruct();
     try cw.fieldString(4, schema.name);
-    try cw.fieldI32(5, @intCast(schema.columns.len));
+    try cw.fieldI32(5, @intCast(schemaTopLevelChildCount(schema)));
     try cw.endStruct();
 }
 
-fn writeSchemaColumn(cw: *CompactWriter, column: types.Column) !void {
+fn schemaElementCount(schema: types.Schema) usize {
+    var count: usize = 1;
+    var column_index: usize = 0;
+    while (column_index < schema.columns.len) {
+        const column = schema.columns[column_index];
+        if (listMapColumnSpan(schema.columns, column_index)) |span| {
+            count += if (span == 2) 6 else 5;
+            column_index += span;
+        } else if (nestedMapColumnSpan(schema.columns, column_index)) |span| {
+            count += if (span == 3) 7 else 6;
+            column_index += span;
+        } else if (column.map_info != null and mapValueColumnIndex(schema.columns, column_index) != null) {
+            count += 4;
+            column_index += 2;
+        } else {
+            count += if (column.list_info != null) schemaListElementCount(column) else 1;
+            column_index += 1;
+        }
+    }
+    return count;
+}
+
+fn schemaTopLevelChildCount(schema: types.Schema) usize {
+    var count: usize = 0;
+    var column_index: usize = 0;
+    while (column_index < schema.columns.len) {
+        count += 1;
+        if (listMapColumnSpan(schema.columns, column_index)) |span| {
+            column_index += span;
+        } else if (nestedMapColumnSpan(schema.columns, column_index)) |span| {
+            column_index += span;
+        } else if (schema.columns[column_index].map_info != null and mapValueColumnIndex(schema.columns, column_index) != null) {
+            column_index += 2;
+        } else {
+            column_index += 1;
+        }
+    }
+    return count;
+}
+
+fn writeSchemaColumn(cw: *CompactWriter, columns: []const types.Column, column_index: usize) !usize {
+    const column = columns[column_index];
+    if (listMapColumnSpan(columns, column_index)) |span| {
+        try writeSchemaListMapColumn(cw, columns[column_index..][0..span]);
+        return span;
+    }
+    if (nestedMapColumnSpan(columns, column_index)) |span| {
+        try writeSchemaNestedMapColumn(cw, columns[column_index..][0..span]);
+        return span;
+    }
+    if (column.map_info != null) {
+        if (column.path.len != 3 or !std.mem.eql(u8, column.path[2], "key")) return error.InvalidSchema;
+        const value_index = mapValueColumnIndex(columns, column_index);
+        try writeSchemaMapColumn(cw, column, if (value_index) |idx| columns[idx] else null);
+        return if (value_index != null) 2 else 1;
+    }
+    if (column.list_info != null) {
+        try writeSchemaListColumn(cw, column);
+        return 1;
+    }
+    try writeSchemaLeaf(cw, column.name, column.repetition, column.column_type);
+    return 1;
+}
+
+fn mapValueColumnIndex(columns: []const types.Column, key_index: usize) ?usize {
+    if (key_index + 1 >= columns.len) return null;
+    const key = columns[key_index];
+    const value = columns[key_index + 1];
+    if (key.map_info == null or value.map_info == null) return null;
+    if (key.path.len != 3 or value.path.len != 3) return null;
+    if (!std.mem.eql(u8, key.path[0], value.path[0])) return null;
+    if (!std.mem.eql(u8, key.path[1], value.path[1])) return null;
+    if (!std.mem.eql(u8, key.path[2], "key") or !std.mem.eql(u8, value.path[2], "value")) return null;
+    return key_index + 1;
+}
+
+fn listMapColumnSpan(columns: []const types.Column, key_index: usize) ?usize {
+    const key = columns[key_index];
+    if (key.map_info == null or key.path.len != 5) return null;
+    if (!std.mem.eql(u8, key.path[1], "list") or
+        !std.mem.eql(u8, key.path[2], "element") or
+        !std.mem.eql(u8, key.path[3], "key_value") or
+        !std.mem.eql(u8, key.path[4], "key"))
+        return null;
+
+    if (key_index + 1 < columns.len) {
+        const value = columns[key_index + 1];
+        if (value.map_info != null and listMapLeafPathsShareMap(key, value)) return 2;
+    }
+    return 1;
+}
+
+fn nestedMapColumnSpan(columns: []const types.Column, key_index: usize) ?usize {
+    if (key_index + 1 >= columns.len) return null;
+    const outer_key = columns[key_index];
+    const inner_key = columns[key_index + 1];
+    if (outer_key.map_info == null or inner_key.map_info == null) return null;
+    if (outer_key.path.len != 3 or inner_key.path.len != 5) return null;
+    if (!std.mem.eql(u8, outer_key.path[1], "key_value") or !std.mem.eql(u8, outer_key.path[2], "key")) return null;
+    if (!std.mem.eql(u8, inner_key.path[0], outer_key.path[0])) return null;
+    if (!std.mem.eql(u8, inner_key.path[1], outer_key.path[1])) return null;
+    if (!std.mem.eql(u8, inner_key.path[2], "value")) return null;
+    if (!std.mem.eql(u8, inner_key.path[3], "key_value") or !std.mem.eql(u8, inner_key.path[4], "key")) return null;
+
+    if (key_index + 2 < columns.len) {
+        const inner_value = columns[key_index + 2];
+        if (inner_value.map_info != null and inner_value.path.len == 5 and
+            std.mem.eql(u8, inner_value.path[0], inner_key.path[0]) and
+            std.mem.eql(u8, inner_value.path[1], inner_key.path[1]) and
+            std.mem.eql(u8, inner_value.path[2], inner_key.path[2]) and
+            std.mem.eql(u8, inner_value.path[3], inner_key.path[3]) and
+            std.mem.eql(u8, inner_value.path[4], "value"))
+        {
+            return 3;
+        }
+    }
+    return 2;
+}
+
+fn listMapLeafPathsShareMap(key: types.Column, value: types.Column) bool {
+    return value.path.len == 5 and
+        std.mem.eql(u8, value.path[0], key.path[0]) and
+        std.mem.eql(u8, value.path[1], key.path[1]) and
+        std.mem.eql(u8, value.path[2], key.path[2]) and
+        std.mem.eql(u8, value.path[3], key.path[3]) and
+        std.mem.eql(u8, value.path[4], "value");
+}
+
+fn writeSchemaMapColumn(cw: *CompactWriter, key_column: types.Column, value_column: ?types.Column) !void {
+    const map_info = key_column.map_info orelse return error.InvalidSchema;
+    if (key_column.path.len != 3) return error.InvalidSchema;
+    const map_repetition: types.Repetition = if (map_info.map_definition_level > 0) .optional else .required;
+
     try cw.beginStruct();
-    try cw.fieldI32(1, @intFromEnum(column.column_type.physical));
-    if (column.column_type.type_length) |len| try cw.fieldI32(2, len);
-    try cw.fieldI32(3, @intFromEnum(column.repetition));
-    try cw.fieldString(4, column.name);
-    switch (column.column_type.logical) {
+    try cw.fieldI32(3, @intFromEnum(map_repetition));
+    try cw.fieldString(4, key_column.path[0]);
+    try cw.fieldI32(5, 1);
+    try cw.fieldI32(6, @intFromEnum(types.ConvertedType.map));
+    try cw.fieldStructBegin(10);
+    try cw.fieldStructBegin(2);
+    try cw.endStruct();
+    try cw.endStruct();
+    try cw.endStruct();
+
+    try cw.beginStruct();
+    try cw.fieldI32(3, @intFromEnum(types.Repetition.repeated));
+    try cw.fieldString(4, key_column.path[1]);
+    try cw.fieldI32(5, if (value_column == null) 1 else 2);
+    try cw.endStruct();
+
+    try writeSchemaLeaf(cw, key_column.path[2], .required, key_column.column_type);
+    if (value_column) |value| {
+        const value_repetition: types.Repetition = if (value.max_definition_level > map_info.map_definition_level + 1) .optional else .required;
+        try writeSchemaLeaf(cw, value.path[2], value_repetition, value.column_type);
+    }
+}
+
+fn writeSchemaListMapColumn(cw: *CompactWriter, columns: []const types.Column) !void {
+    if (columns.len != 1 and columns.len != 2) return error.InvalidSchema;
+    const key_column = columns[0];
+    const value_column: ?types.Column = if (columns.len == 2) columns[1] else null;
+    if (key_column.path.len != 5 or key_column.nested_logical_info.len != 2) return error.InvalidSchema;
+    const list_info = key_column.nested_logical_info[0];
+    const map_logical_info = key_column.nested_logical_info[1];
+    const map_info = key_column.map_info orelse return error.InvalidSchema;
+    if (list_info.kind != .list or map_logical_info.kind != .map) return error.InvalidSchema;
+    const list_repetition: types.Repetition = if (list_info.optional) .optional else .required;
+    const map_repetition: types.Repetition = if (map_logical_info.optional) .optional else .required;
+
+    try cw.beginStruct();
+    try cw.fieldI32(3, @intFromEnum(list_repetition));
+    try cw.fieldString(4, key_column.path[0]);
+    try cw.fieldI32(5, 1);
+    try cw.fieldI32(6, @intFromEnum(types.ConvertedType.list));
+    try cw.fieldStructBegin(10);
+    try cw.fieldStructBegin(3);
+    try cw.endStruct();
+    try cw.endStruct();
+    try cw.endStruct();
+
+    try cw.beginStruct();
+    try cw.fieldI32(3, @intFromEnum(types.Repetition.repeated));
+    try cw.fieldString(4, key_column.path[1]);
+    try cw.fieldI32(5, 1);
+    try cw.endStruct();
+
+    try cw.beginStruct();
+    try cw.fieldI32(3, @intFromEnum(map_repetition));
+    try cw.fieldString(4, key_column.path[2]);
+    try cw.fieldI32(5, 1);
+    try cw.fieldI32(6, @intFromEnum(types.ConvertedType.map));
+    try cw.fieldStructBegin(10);
+    try cw.fieldStructBegin(2);
+    try cw.endStruct();
+    try cw.endStruct();
+    try cw.endStruct();
+
+    try cw.beginStruct();
+    try cw.fieldI32(3, @intFromEnum(types.Repetition.repeated));
+    try cw.fieldString(4, key_column.path[3]);
+    try cw.fieldI32(5, if (value_column == null) 1 else 2);
+    try cw.endStruct();
+
+    try writeSchemaLeaf(cw, key_column.path[4], .required, key_column.column_type);
+    if (value_column) |value| {
+        const value_repetition: types.Repetition = if (value.max_definition_level > map_info.map_definition_level + 1) .optional else .required;
+        try writeSchemaLeaf(cw, value.path[4], value_repetition, value.column_type);
+    }
+}
+
+fn writeSchemaNestedMapColumn(cw: *CompactWriter, columns: []const types.Column) !void {
+    if (columns.len != 2 and columns.len != 3) return error.InvalidSchema;
+    const outer_key = columns[0];
+    const inner_key = columns[1];
+    const inner_value: ?types.Column = if (columns.len == 3) columns[2] else null;
+    const outer_info = outer_key.map_info orelse return error.InvalidSchema;
+    const inner_info = inner_key.map_info orelse return error.InvalidSchema;
+    if (outer_key.path.len != 3 or inner_key.path.len != 5) return error.InvalidSchema;
+    const outer_repetition: types.Repetition = if (outer_info.map_definition_level > 0) .optional else .required;
+    const inner_repetition: types.Repetition = if (inner_info.map_definition_level > outer_key.max_definition_level) .optional else .required;
+
+    try cw.beginStruct();
+    try cw.fieldI32(3, @intFromEnum(outer_repetition));
+    try cw.fieldString(4, outer_key.path[0]);
+    try cw.fieldI32(5, 1);
+    try cw.fieldI32(6, @intFromEnum(types.ConvertedType.map));
+    try cw.fieldStructBegin(10);
+    try cw.fieldStructBegin(2);
+    try cw.endStruct();
+    try cw.endStruct();
+    try cw.endStruct();
+
+    try cw.beginStruct();
+    try cw.fieldI32(3, @intFromEnum(types.Repetition.repeated));
+    try cw.fieldString(4, outer_key.path[1]);
+    try cw.fieldI32(5, 2);
+    try cw.endStruct();
+
+    try writeSchemaLeaf(cw, outer_key.path[2], .required, outer_key.column_type);
+
+    try cw.beginStruct();
+    try cw.fieldI32(3, @intFromEnum(inner_repetition));
+    try cw.fieldString(4, inner_key.path[2]);
+    try cw.fieldI32(5, 1);
+    try cw.fieldI32(6, @intFromEnum(types.ConvertedType.map));
+    try cw.fieldStructBegin(10);
+    try cw.fieldStructBegin(2);
+    try cw.endStruct();
+    try cw.endStruct();
+    try cw.endStruct();
+
+    try cw.beginStruct();
+    try cw.fieldI32(3, @intFromEnum(types.Repetition.repeated));
+    try cw.fieldString(4, inner_key.path[3]);
+    try cw.fieldI32(5, if (inner_value == null) 1 else 2);
+    try cw.endStruct();
+
+    try writeSchemaLeaf(cw, inner_key.path[4], .required, inner_key.column_type);
+    if (inner_value) |value| {
+        const value_repetition: types.Repetition = if (value.max_definition_level > inner_info.map_definition_level + 1) .optional else .required;
+        try writeSchemaLeaf(cw, value.path[4], value_repetition, value.column_type);
+    }
+}
+
+fn writeSchemaListColumn(cw: *CompactWriter, column: types.Column) !void {
+    const list_info = column.list_info orelse return error.InvalidSchema;
+    const list_count = schemaListCount(column);
+    if (list_count == 0 or column.path.len != list_count * 2 + 1) return error.InvalidSchema;
+
+    var list_index: usize = 0;
+    while (list_index < list_count) : (list_index += 1) {
+        const list_repetition: types.Repetition = if (schemaListOptional(column, list_index)) .optional else .required;
+
+        try cw.beginStruct();
+        try cw.fieldI32(3, @intFromEnum(list_repetition));
+        try cw.fieldString(4, column.path[list_index * 2]);
+        try cw.fieldI32(5, 1);
+        try cw.fieldI32(6, @intFromEnum(types.ConvertedType.list));
+        try cw.fieldStructBegin(10);
+        try cw.fieldStructBegin(3);
+        try cw.endStruct();
+        try cw.endStruct();
+        try cw.endStruct();
+
+        try cw.beginStruct();
+        try cw.fieldI32(3, @intFromEnum(types.Repetition.repeated));
+        try cw.fieldString(4, column.path[list_index * 2 + 1]);
+        try cw.fieldI32(5, 1);
+        try cw.endStruct();
+    }
+
+    const element_repetition: types.Repetition = if (column.max_definition_level > list_info.list_definition_level + 1) .optional else .required;
+    try writeSchemaLeaf(cw, column.path[list_count * 2], element_repetition, column.column_type);
+}
+
+fn schemaListElementCount(column: types.Column) usize {
+    return schemaListCount(column) * 2 + 1;
+}
+
+fn schemaListCount(column: types.Column) usize {
+    var count: usize = 0;
+    for (column.nested_logical_info) |logical_info| {
+        if (logical_info.kind == .list) count += 1;
+    }
+    if (count == 0 and column.list_info != null) return 1;
+    return count;
+}
+
+fn schemaListOptional(column: types.Column, list_index: usize) bool {
+    var seen: usize = 0;
+    for (column.nested_logical_info) |logical_info| {
+        if (logical_info.kind != .list) continue;
+        if (seen == list_index) return logical_info.optional;
+        seen += 1;
+    }
+    const list_info = column.list_info orelse return false;
+    return list_index == 0 and list_info.list_definition_level > 0;
+}
+
+fn writeSchemaLeaf(cw: *CompactWriter, name: []const u8, repetition: types.Repetition, column_type: types.ColumnType) !void {
+    try cw.beginStruct();
+    try cw.fieldI32(1, @intFromEnum(column_type.physical));
+    if (column_type.type_length) |len| try cw.fieldI32(2, len);
+    try cw.fieldI32(3, @intFromEnum(repetition));
+    try cw.fieldString(4, name);
+    switch (column_type.logical) {
         .none => {},
         .string => {
             try cw.fieldI32(6, @intFromEnum(types.ConvertedType.utf8));
@@ -530,8 +852,8 @@ fn writeSchemaColumn(cw: *CompactWriter, column: types.Column) !void {
             try cw.endStruct();
         },
         .decimal => {
-            const precision = column.column_type.decimal_precision orelse return error.InvalidSchema;
-            const scale = column.column_type.decimal_scale orelse 0;
+            const precision = column_type.decimal_precision orelse return error.InvalidSchema;
+            const scale = column_type.decimal_scale orelse 0;
             try cw.fieldI32(6, @intFromEnum(types.ConvertedType.decimal));
             try cw.fieldI32(7, scale);
             try cw.fieldI32(8, precision);
@@ -665,7 +987,8 @@ pub fn writeColumnIndex(writer: *std.Io.Writer, entries: []const types.PageIndex
 
 fn isNullPage(entry: types.PageIndexEntry) bool {
     const null_count = entry.statistics.null_count orelse return false;
-    return null_count == entry.row_count;
+    const value_count = if (entry.value_count > 0) entry.value_count else entry.row_count;
+    return null_count == value_count;
 }
 
 pub fn readOffsetIndex(allocator: std.mem.Allocator, bytes: []const u8) ![]types.PageIndexEntry {
@@ -868,38 +1191,129 @@ fn readSchema(allocator: std.mem.Allocator, cr: *CompactReader) !types.Schema {
     const hdr = try cr.readListHeader();
     if (hdr.elem_type != .struct_ or hdr.len == 0) return error.CorruptMetadata;
 
-    var root_name: []const u8 = "";
-    var root_children: ?i32 = null;
-    var columns = try allocator.alloc(types.Column, hdr.len - 1);
-    errdefer allocator.free(columns);
-
+    const elements = try allocator.alloc(SchemaElement, hdr.len);
+    errdefer allocator.free(elements);
     var idx: usize = 0;
     while (idx < hdr.len) : (idx += 1) {
-        const element = try readSchemaElement(allocator, cr);
-        if (idx == 0) {
-            root_name = element.name;
-            root_children = element.num_children;
-            if (element.physical_type != null) return error.UnsupportedNestedSchema;
-        } else {
-            if (element.num_children != null) return error.UnsupportedNestedSchema;
-            columns[idx - 1] = .{
-                .name = element.name,
-                .column_type = .{
-                    .physical = element.physical_type orelse return error.CorruptMetadata,
-                    .logical = element.logical,
-                    .type_length = element.type_length,
-                    .decimal_precision = element.decimal_precision,
-                    .decimal_scale = element.decimal_scale,
-                },
-                .repetition = element.repetition orelse return error.CorruptMetadata,
-            };
-        }
+        elements[idx] = try readSchemaElement(allocator, cr);
     }
 
-    if (root_children) |children| {
-        if (children != columns.len) return error.UnsupportedNestedSchema;
+    const root = elements[0];
+    if (root.physical_type != null) return error.CorruptMetadata;
+    const root_children = root.num_children orelse return error.CorruptMetadata;
+    if (root_children < 0) return error.CorruptMetadata;
+
+    var columns: std.ArrayList(types.Column) = .empty;
+    errdefer columns.deinit(allocator);
+    var path_stack: std.ArrayList([]const u8) = .empty;
+    defer path_stack.deinit(allocator);
+    var repeated_stack: std.ArrayList(types.RepeatedLevelInfo) = .empty;
+    defer repeated_stack.deinit(allocator);
+    var logical_stack: std.ArrayList(types.NestedLogicalInfo) = .empty;
+    defer logical_stack.deinit(allocator);
+
+    var element_index: usize = 1;
+    var child: i32 = 0;
+    while (child < root_children) : (child += 1) {
+        try collectSchemaLeaves(allocator, elements, &element_index, 0, 0, null, null, &path_stack, &repeated_stack, &logical_stack, &columns);
     }
-    return .{ .name = root_name, .columns = columns };
+    if (element_index != elements.len) return error.CorruptMetadata;
+
+    return .{ .name = root.name, .columns = try columns.toOwnedSlice(allocator) };
+}
+
+fn collectSchemaLeaves(
+    allocator: std.mem.Allocator,
+    elements: []const SchemaElement,
+    element_index: *usize,
+    parent_definition_level: u16,
+    parent_repetition_level: u16,
+    parent_list_info: ?types.ListInfo,
+    parent_map_info: ?types.MapInfo,
+    path_stack: *std.ArrayList([]const u8),
+    repeated_stack: *std.ArrayList(types.RepeatedLevelInfo),
+    logical_stack: *std.ArrayList(types.NestedLogicalInfo),
+    columns: *std.ArrayList(types.Column),
+) !void {
+    if (element_index.* >= elements.len) return error.CorruptMetadata;
+    const element = elements[element_index.*];
+    element_index.* += 1;
+    try path_stack.append(allocator, element.name);
+    defer _ = path_stack.pop();
+
+    const repetition = element.repetition orelse return error.CorruptMetadata;
+    var definition_level = parent_definition_level;
+    var repetition_level = parent_repetition_level;
+    switch (repetition) {
+        .required => {},
+        .optional => definition_level = std.math.add(u16, definition_level, 1) catch return error.CorruptMetadata,
+        .repeated => {
+            definition_level = std.math.add(u16, definition_level, 1) catch return error.CorruptMetadata;
+            repetition_level = std.math.add(u16, repetition_level, 1) catch return error.CorruptMetadata;
+        },
+    }
+    const pushed_repeated = repetition == .repeated;
+    if (pushed_repeated) {
+        try repeated_stack.append(allocator, .{
+            .repetition_level = repetition_level,
+            .path = try allocator.dupe([]const u8, path_stack.items),
+        });
+    }
+    defer {
+        if (pushed_repeated) _ = repeated_stack.pop();
+    }
+
+    const list_info = if (element.is_list)
+        types.ListInfo{ .list_definition_level = definition_level }
+    else
+        parent_list_info;
+    const map_info = if (element.is_map)
+        types.MapInfo{ .map_definition_level = definition_level }
+    else
+        parent_map_info;
+    const pushed_logical = element.is_list or element.is_map;
+    if (pushed_logical) {
+        try logical_stack.append(allocator, .{
+            .kind = if (element.is_list) .list else .map,
+            .definition_level = definition_level,
+            .repetition_level = repetition_level,
+            .path = try allocator.dupe([]const u8, path_stack.items),
+            .optional = repetition == .optional,
+        });
+    }
+    defer {
+        if (pushed_logical) _ = logical_stack.pop();
+    }
+
+    if (element.physical_type) |physical| {
+        if (element.num_children != null) return error.CorruptMetadata;
+        try columns.append(allocator, .{
+            .name = element.name,
+            .path = try allocator.dupe([]const u8, path_stack.items),
+            .column_type = .{
+                .physical = physical,
+                .logical = element.logical,
+                .type_length = element.type_length,
+                .decimal_precision = element.decimal_precision,
+                .decimal_scale = element.decimal_scale,
+            },
+            .repetition = if (repetition_level > 0) .repeated else if (definition_level > 0) .optional else .required,
+            .max_definition_level = definition_level,
+            .max_repetition_level = repetition_level,
+            .repeated_level_info = try allocator.dupe(types.RepeatedLevelInfo, repeated_stack.items),
+            .nested_logical_info = try allocator.dupe(types.NestedLogicalInfo, logical_stack.items),
+            .list_info = list_info,
+            .map_info = map_info,
+        });
+        return;
+    }
+
+    const children = element.num_children orelse return error.CorruptMetadata;
+    if (children < 0) return error.CorruptMetadata;
+    var child: i32 = 0;
+    while (child < children) : (child += 1) {
+        try collectSchemaLeaves(allocator, elements, element_index, definition_level, repetition_level, list_info, map_info, path_stack, repeated_stack, logical_stack, columns);
+    }
 }
 
 const SchemaElement = struct {
@@ -911,6 +1325,8 @@ const SchemaElement = struct {
     logical: types.LogicalType = .none,
     decimal_precision: ?i32 = null,
     decimal_scale: ?i32 = null,
+    is_list: bool = false,
+    is_map: bool = false,
 };
 
 fn readSchemaElement(allocator: std.mem.Allocator, cr: *CompactReader) !SchemaElement {
@@ -933,6 +1349,8 @@ fn readSchemaElement(allocator: std.mem.Allocator, cr: *CompactReader) !SchemaEl
                     .timestamp_micros => .timestamp_micros,
                     else => out.logical,
                 };
+                if (converted == .list) out.is_list = true;
+                if (converted == .map) out.is_map = true;
             },
             7 => out.decimal_scale = try cr.readI32(),
             8 => out.decimal_precision = try cr.readI32(),
@@ -941,6 +1359,8 @@ fn readSchemaElement(allocator: std.mem.Allocator, cr: *CompactReader) !SchemaEl
                 out.logical = logical.logical;
                 if (logical.decimal_precision) |precision| out.decimal_precision = precision;
                 if (logical.decimal_scale) |scale| out.decimal_scale = scale;
+                if (logical.is_list) out.is_list = true;
+                if (logical.is_map) out.is_map = true;
             },
             else => try cr.skip(field.compact_type),
         }
@@ -953,6 +1373,8 @@ const LogicalTypeRead = struct {
     logical: types.LogicalType = .none,
     decimal_precision: ?i32 = null,
     decimal_scale: ?i32 = null,
+    is_list: bool = false,
+    is_map: bool = false,
 };
 
 fn readLogicalType(cr: *CompactReader) !LogicalTypeRead {
@@ -969,6 +1391,14 @@ fn readLogicalType(cr: *CompactReader) !LogicalTypeRead {
                 out.logical = .decimal;
                 out.decimal_precision = decimal.precision;
                 out.decimal_scale = decimal.scale;
+            },
+            3 => {
+                try cr.skip(field.compact_type);
+                out.is_list = true;
+            },
+            2 => {
+                try cr.skip(field.compact_type);
+                out.is_map = true;
             },
             6 => {
                 try cr.skip(field.compact_type);
@@ -1162,13 +1592,33 @@ fn readEncodingList(allocator: std.mem.Allocator, cr: *CompactReader) ![]types.E
 fn readPathList(allocator: std.mem.Allocator, cr: *CompactReader) ![]const u8 {
     const hdr = try cr.readListHeader();
     if (hdr.elem_type != .binary or hdr.len == 0) return error.CorruptMetadata;
-    var first: []const u8 = "";
+    var parts = try allocator.alloc([]const u8, hdr.len);
+    errdefer allocator.free(parts);
+    var total_len: usize = 0;
     var i: usize = 0;
     while (i < hdr.len) : (i += 1) {
-        const part = try cr.readBinaryAlloc(allocator);
-        if (i == 0) first = part;
+        parts[i] = try cr.readBinaryAlloc(allocator);
+        total_len = std.math.add(usize, total_len, parts[i].len) catch return error.CorruptMetadata;
+        if (i > 0) total_len = std.math.add(usize, total_len, 1) catch return error.CorruptMetadata;
     }
-    return first;
+    if (hdr.len == 1) {
+        const only = parts[0];
+        allocator.free(parts);
+        return only;
+    }
+
+    const out = try allocator.alloc(u8, total_len);
+    var offset: usize = 0;
+    for (parts, 0..) |part, part_index| {
+        if (part_index > 0) {
+            out[offset] = '.';
+            offset += 1;
+        }
+        @memcpy(out[offset..][0..part.len], part);
+        offset += part.len;
+    }
+    allocator.free(parts);
+    return out;
 }
 
 fn encodeZigZag(comptime T: type, value: T) u64 {

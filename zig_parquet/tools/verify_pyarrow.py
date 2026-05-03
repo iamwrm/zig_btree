@@ -12,10 +12,21 @@ import pyarrow.parquet as pq
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TMP = ROOT / "zig_parquet" / "tmp"
 ZIG_WRITER = ROOT / "zig-out" / "bin" / "parquet_write_fixture"
+ZIG_LIST_WRITER = ROOT / "zig-out" / "bin" / "parquet_write_list_fixture"
+ZIG_NESTED_LIST_WRITER = ROOT / "zig-out" / "bin" / "parquet_write_nested_list_fixture"
+ZIG_MAP_WRITER = ROOT / "zig-out" / "bin" / "parquet_write_map_fixture"
+ZIG_NESTED_MAP_WRITER = ROOT / "zig-out" / "bin" / "parquet_write_nested_map_fixture"
+ZIG_LIST_MAP_WRITER = ROOT / "zig-out" / "bin" / "parquet_write_list_map_fixture"
+ZIG_MIXED_WRITER = ROOT / "zig-out" / "bin" / "parquet_write_mixed_fixture"
+ZIG_REPEATED_WRITER = ROOT / "zig-out" / "bin" / "parquet_write_repeated_fixture"
 ZIG_SEQUENCE_WRITER = ROOT / "zig-out" / "bin" / "parquet_write_sequence"
 ZIG_READER = ROOT / "zig-out" / "bin" / "parquet_read_fixture"
 ZIG_SEQUENCE = ROOT / "zig-out" / "bin" / "parquet_validate_sequence"
 ZIG_IDS = ROOT / "zig-out" / "bin" / "parquet_validate_ids"
+ZIG_NESTED_LOGICAL = ROOT / "zig-out" / "bin" / "parquet_validate_nested_logical"
+ZIG_NESTED_MAP_PAIR = ROOT / "zig-out" / "bin" / "parquet_validate_nested_map_pair"
+ZIG_ZSTD_FAST = ROOT / "zig-out" / "bin" / "parquet_verify_zstd_fast"
+ZIG_BENCH_READER = ROOT / "zig-out" / "bin" / "parquet_bench_read"
 
 
 EXPECTED = [
@@ -50,6 +61,10 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, cwd=ROOT, check=True)
 
 
+def run_quiet(cmd: list[str]) -> None:
+    subprocess.run(cmd, cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+
+
 def validate_sequence_file(path: pathlib.Path, rows: int) -> None:
     table = pq.read_table(path)
     ids = table.column("id").to_pylist()
@@ -76,6 +91,10 @@ def assert_page_indexes(path: pathlib.Path) -> None:
                 raise AssertionError(f"Zig output missing ColumnIndex for {path.name} rg={rg_idx} column={column.path_in_schema}")
 
 
+def verify_zstd_fast_path(path: pathlib.Path) -> None:
+    run([str(ZIG_ZSTD_FAST), str(path)])
+
+
 def main() -> int:
     TMP.mkdir(parents=True, exist_ok=True)
     zig_file = TMP / "zig_fixture.parquet"
@@ -89,13 +108,30 @@ def main() -> int:
     pyarrow_dictionary = TMP / "pyarrow_dictionary.parquet"
     pyarrow_default = TMP / "pyarrow_default.parquet"
     pyarrow_gzip = TMP / "pyarrow_gzip.parquet"
+    pyarrow_lz4 = TMP / "pyarrow_lz4.parquet"
     pyarrow_v2 = TMP / "pyarrow_v2.parquet"
     pyarrow_v2_gzip = TMP / "pyarrow_v2_gzip.parquet"
+    pyarrow_v2_lz4 = TMP / "pyarrow_v2_lz4.parquet"
     pyarrow_v2_zstd = TMP / "pyarrow_v2_zstd.parquet"
     pyarrow_temporal = TMP / "pyarrow_temporal.parquet"
     zig_zstd = TMP / "zig_zstd.parquet"
     zig_snappy = TMP / "zig_snappy.parquet"
     zig_gzip = TMP / "zig_gzip.parquet"
+    zig_lz4 = TMP / "zig_lz4.parquet"
+    zig_list = TMP / "zig_list.parquet"
+    zig_list_v2_zstd = TMP / "zig_list_v2_zstd.parquet"
+    zig_nested_list = TMP / "zig_nested_list.parquet"
+    zig_nested_list_v2_zstd = TMP / "zig_nested_list_v2_zstd.parquet"
+    zig_map = TMP / "zig_map.parquet"
+    zig_map_v2_zstd = TMP / "zig_map_v2_zstd.parquet"
+    zig_nested_map = TMP / "zig_nested_map.parquet"
+    zig_nested_map_v2_zstd = TMP / "zig_nested_map_v2_zstd.parquet"
+    zig_list_map = TMP / "zig_list_map.parquet"
+    zig_list_map_v2_zstd = TMP / "zig_list_map_v2_zstd.parquet"
+    zig_mixed = TMP / "zig_mixed.parquet"
+    zig_mixed_v2_zstd = TMP / "zig_mixed_v2_zstd.parquet"
+    zig_repeated = TMP / "zig_repeated.parquet"
+    zig_repeated_v2_zstd = TMP / "zig_repeated_v2_zstd.parquet"
     zig_sequence_uncompressed = TMP / "zig_sequence_uncompressed.parquet"
     zig_sequence_zstd = TMP / "zig_sequence_zstd.parquet"
     zig_sequence_zstd_bss = TMP / "zig_sequence_zstd_bss.parquet"
@@ -134,6 +170,7 @@ def main() -> int:
         raise AssertionError(f"PyArrow did not see Zig fixed binary statistics: {blob_stats}")
 
     run([str(ZIG_WRITER), str(zig_zstd), "zstd"])
+    verify_zstd_fast_path(zig_zstd)
     zig_zstd_table = pq.read_table(zig_zstd)
     if zig_zstd_table.to_pylist() != EXPECTED:
         raise AssertionError(f"PyArrow misread Zig zstd output: {zig_zstd_table.to_pylist()!r}")
@@ -147,6 +184,222 @@ def main() -> int:
     zig_gzip_table = pq.read_table(zig_gzip)
     if zig_gzip_table.to_pylist() != EXPECTED:
         raise AssertionError(f"PyArrow misread Zig gzip output: {zig_gzip_table.to_pylist()!r}")
+
+    run([str(ZIG_WRITER), str(zig_lz4), "lz4_raw"])
+    zig_lz4_table = pq.read_table(zig_lz4)
+    if zig_lz4_table.to_pylist() != EXPECTED:
+        raise AssertionError(f"PyArrow misread Zig lz4_raw output: {zig_lz4_table.to_pylist()!r}")
+
+    expected_repeated = [{"items": [10, 11]}, {"items": []}, {"items": [20]}, {"items": []}]
+    for path, args in (
+        (zig_repeated, []),
+        (zig_repeated_v2_zstd, ["zstd", "v2"]),
+    ):
+        run([str(ZIG_REPEATED_WRITER), str(path), *args])
+        table = pq.read_table(path)
+        if table.to_pylist() != expected_repeated:
+            raise AssertionError(f"PyArrow misread Zig repeated primitive output {path.name}: {table.to_pylist()!r}")
+        assert_page_indexes(path)
+        metadata = pq.ParquetFile(path).metadata.row_group(0).column(0)
+        if metadata.num_values != 5:
+            raise AssertionError(f"PyArrow saw wrong repeated primitive level count for {path.name}: {metadata.num_values}")
+        stats = metadata.statistics
+        if stats is None or not stats.has_min_max or stats.min != 10 or stats.max != 20 or stats.null_count != 2:
+            raise AssertionError(f"PyArrow saw wrong repeated primitive stats for {path.name}: {stats}")
+
+    expected_list = [{"items": None}, {"items": []}, {"items": [10, None, 11]}, {"items": [20]}]
+    for path, args in (
+        (zig_list, []),
+        (zig_list_v2_zstd, ["zstd", "v2"]),
+    ):
+        run([str(ZIG_LIST_WRITER), str(path), *args])
+        table = pq.read_table(path)
+        if table.to_pylist() != expected_list:
+            raise AssertionError(f"PyArrow misread Zig LIST output {path.name}: {table.to_pylist()!r}")
+        assert_page_indexes(path)
+        metadata = pq.ParquetFile(path).metadata.row_group(0).column(0)
+        if metadata.path_in_schema != "items.list.element" or metadata.num_values != 6:
+            raise AssertionError(f"PyArrow saw wrong LIST column metadata for {path.name}: {metadata.path_in_schema} {metadata.num_values}")
+        stats = metadata.statistics
+        if stats is None or not stats.has_min_max or stats.min != 10 or stats.max != 20 or stats.null_count != 3:
+            raise AssertionError(f"PyArrow saw wrong LIST stats for {path.name}: {stats}")
+
+    expected_nested_list = [{"a": None}, {"a": []}, {"a": [None, [], [1, None, 2]]}, {"a": [[3]]}]
+    for path, args in (
+        (zig_nested_list, []),
+        (zig_nested_list_v2_zstd, ["zstd", "v2"]),
+    ):
+        run([str(ZIG_NESTED_LIST_WRITER), str(path), *args])
+        table = pq.read_table(path)
+        if table.to_pylist() != expected_nested_list:
+            raise AssertionError(f"PyArrow misread Zig nested LIST output {path.name}: {table.to_pylist()!r}")
+        metadata = pq.ParquetFile(path).metadata.row_group(0).column(0)
+        if not metadata.has_offset_index:
+            raise AssertionError(f"Zig output missing nested LIST OffsetIndex for {path.name}")
+        if metadata.path_in_schema != "a.list.element.list.element" or metadata.num_values != 8:
+            raise AssertionError(f"PyArrow saw wrong nested LIST metadata for {path.name}: {metadata.path_in_schema} {metadata.num_values}")
+        stats = metadata.statistics
+        if stats is None or not stats.has_min_max or stats.min != 1 or stats.max != 3 or stats.null_count != 5:
+            raise AssertionError(f"PyArrow saw wrong nested LIST stats for {path.name}: {stats}")
+        run(
+            [
+                str(ZIG_NESTED_LOGICAL),
+                str(path),
+                "a.list.element.list.element",
+                "4",
+                "4,4",
+                "1,1",
+                "4",
+                "3",
+                "1",
+                "6",
+            ]
+        )
+
+    expected_map = [{"attrs": None}, {"attrs": []}, {"attrs": [(1, 10), (2, None)]}, {"attrs": [(3, 20)]}]
+    for path, args in (
+        (zig_map, []),
+        (zig_map_v2_zstd, ["zstd", "v2"]),
+    ):
+        run([str(ZIG_MAP_WRITER), str(path), *args])
+        table = pq.read_table(path)
+        if table.to_pylist() != expected_map:
+            raise AssertionError(f"PyArrow misread Zig MAP output {path.name}: {table.to_pylist()!r}")
+        assert_page_indexes(path)
+        metadata = pq.ParquetFile(path).metadata.row_group(0)
+        key_column = metadata.column(0)
+        value_column = metadata.column(1)
+        if key_column.path_in_schema != "attrs.key_value.key" or value_column.path_in_schema != "attrs.key_value.value":
+            raise AssertionError(f"PyArrow saw wrong MAP column paths for {path.name}: {key_column.path_in_schema} {value_column.path_in_schema}")
+        if key_column.num_values != 5 or value_column.num_values != 5:
+            raise AssertionError(f"PyArrow saw wrong MAP level counts for {path.name}: {key_column.num_values} {value_column.num_values}")
+        key_stats = key_column.statistics
+        value_stats = value_column.statistics
+        if key_stats is None or not key_stats.has_min_max or key_stats.min != 1 or key_stats.max != 3 or key_stats.null_count != 2:
+            raise AssertionError(f"PyArrow saw wrong MAP key stats for {path.name}: {key_stats}")
+        if value_stats is None or not value_stats.has_min_max or value_stats.min != 10 or value_stats.max != 20 or value_stats.null_count != 3:
+            raise AssertionError(f"PyArrow saw wrong MAP value stats for {path.name}: {value_stats}")
+
+    expected_nested_map = [
+        {"a": None},
+        {"a": []},
+        {"a": [("aa", None), ("b", []), ("ccc", [(1, True), (2, False)])]},
+        {"a": [("d", [(3, True)])]},
+    ]
+    for path, args in (
+        (zig_nested_map, []),
+        (zig_nested_map_v2_zstd, ["zstd", "v2"]),
+    ):
+        run([str(ZIG_NESTED_MAP_WRITER), str(path), *args])
+        table = pq.read_table(path)
+        if table.to_pylist() != expected_nested_map:
+            raise AssertionError(f"PyArrow misread Zig nested MAP output {path.name}: {table.to_pylist()!r}")
+        metadata = pq.ParquetFile(path).metadata.row_group(0)
+        expected_paths = [
+            "a.key_value.key",
+            "a.key_value.value.key_value.key",
+            "a.key_value.value.key_value.value",
+        ]
+        paths = [metadata.column(i).path_in_schema for i in range(metadata.num_columns)]
+        if paths != expected_paths:
+            raise AssertionError(f"PyArrow saw wrong nested MAP paths for {path.name}: {paths!r}")
+        counts = [metadata.column(i).num_values for i in range(metadata.num_columns)]
+        if counts != [6, 7, 7]:
+            raise AssertionError(f"PyArrow saw wrong nested MAP level counts for {path.name}: {counts!r}")
+        run([str(ZIG_NESTED_MAP_PAIR), str(path), "a.key_value.key", "a.key_value.value.key_value.key", "4", "4", "4", "4", "3", "3", "1", "0", "7", "6"])
+        run([str(ZIG_NESTED_MAP_PAIR), str(path), "a.key_value.value.key_value.key", "a.key_value.value.key_value.value", "4", "4", "3", "3", "3", "3", "1", "0", "6", "2"])
+
+    expected_list_map = [
+        {"a": None},
+        {"a": []},
+        {"a": [None, [], [("aa", 1), ("b", None)]]},
+        {"a": [[("c", 3)]]},
+    ]
+    for path, args in (
+        (zig_list_map, []),
+        (zig_list_map_v2_zstd, ["zstd", "v2"]),
+    ):
+        run([str(ZIG_LIST_MAP_WRITER), str(path), *args])
+        table = pq.read_table(path)
+        if table.to_pylist() != expected_list_map:
+            raise AssertionError(f"PyArrow misread Zig LIST<MAP> output {path.name}: {table.to_pylist()!r}")
+        metadata = pq.ParquetFile(path).metadata.row_group(0)
+        expected_paths = [
+            "a.list.element.key_value.key",
+            "a.list.element.key_value.value",
+        ]
+        paths = [metadata.column(i).path_in_schema for i in range(metadata.num_columns)]
+        if paths != expected_paths:
+            raise AssertionError(f"PyArrow saw wrong LIST<MAP> paths for {path.name}: {paths!r}")
+        counts = [metadata.column(i).num_values for i in range(metadata.num_columns)]
+        if counts != [7, 7]:
+            raise AssertionError(f"PyArrow saw wrong LIST<MAP> level counts for {path.name}: {counts!r}")
+        run([str(ZIG_NESTED_LOGICAL), str(path), "a.list.element.key_value.key", "4", "4,3", "1,1", "3", "3", "0", "4"])
+        run([str(ZIG_NESTED_LOGICAL), str(path), "a.list.element.key_value.value", "4", "4,3", "1,1", "3", "2", "1", "4"])
+        run([str(ZIG_NESTED_MAP_PAIR), str(path), "a.list.element.key_value.key", "a.list.element.key_value.value", "4", "4", "3", "3", "3", "2", "1", "1", "4", "4"])
+
+    expected_mixed = [
+        {"id": 100, "items": None, "attrs": None, "nested_attrs": None, "list_attrs": None},
+        {"id": 101, "items": [], "attrs": [], "nested_attrs": [], "list_attrs": []},
+        {
+            "id": 102,
+            "items": [10, None, 11],
+            "attrs": [(1, 10), (2, None)],
+            "nested_attrs": [("aa", None), ("b", []), ("ccc", [(1, True), (2, False)])],
+            "list_attrs": [None, [], [("aa", 1), ("b", None)]],
+        },
+        {
+            "id": 103,
+            "items": [20],
+            "attrs": [(3, 20)],
+            "nested_attrs": [("d", [(3, True)])],
+            "list_attrs": [[("c", 3)]],
+        },
+    ]
+    for path, args in (
+        (zig_mixed, []),
+        (zig_mixed_v2_zstd, ["zstd", "v2"]),
+    ):
+        run([str(ZIG_MIXED_WRITER), str(path), *args])
+        table = pq.read_table(path)
+        if table.to_pylist() != expected_mixed:
+            raise AssertionError(f"PyArrow misread Zig mixed output {path.name}: {table.to_pylist()!r}")
+        assert_page_indexes(path)
+        metadata = pq.ParquetFile(path).metadata.row_group(0)
+        paths = [metadata.column(i).path_in_schema for i in range(metadata.num_columns)]
+        expected_paths = [
+            "id",
+            "items.list.element",
+            "attrs.key_value.key",
+            "attrs.key_value.value",
+            "nested_attrs.key_value.key",
+            "nested_attrs.key_value.value.key_value.key",
+            "nested_attrs.key_value.value.key_value.value",
+            "list_attrs.list.element.key_value.key",
+            "list_attrs.list.element.key_value.value",
+        ]
+        if paths != expected_paths:
+            raise AssertionError(f"PyArrow saw wrong mixed paths for {path.name}: {paths!r}")
+        counts = [metadata.column(i).num_values for i in range(metadata.num_columns)]
+        if counts != [4, 6, 5, 5, 6, 7, 7, 7, 7]:
+            raise AssertionError(f"PyArrow saw wrong mixed level counts for {path.name}: {counts!r}")
+        id_stats = metadata.column(0).statistics
+        list_stats = metadata.column(1).statistics
+        key_stats = metadata.column(2).statistics
+        value_stats = metadata.column(3).statistics
+        if id_stats is None or not id_stats.has_min_max or id_stats.min != 100 or id_stats.max != 103 or id_stats.null_count != 0:
+            raise AssertionError(f"PyArrow saw wrong mixed id stats for {path.name}: {id_stats}")
+        if list_stats is None or not list_stats.has_min_max or list_stats.min != 10 or list_stats.max != 20 or list_stats.null_count != 3:
+            raise AssertionError(f"PyArrow saw wrong mixed LIST stats for {path.name}: {list_stats}")
+        if key_stats is None or not key_stats.has_min_max or key_stats.min != 1 or key_stats.max != 3 or key_stats.null_count != 2:
+            raise AssertionError(f"PyArrow saw wrong mixed MAP key stats for {path.name}: {key_stats}")
+        if value_stats is None or not value_stats.has_min_max or value_stats.min != 10 or value_stats.max != 20 or value_stats.null_count != 3:
+            raise AssertionError(f"PyArrow saw wrong mixed MAP value stats for {path.name}: {value_stats}")
+        run([str(ZIG_NESTED_MAP_PAIR), str(path), "nested_attrs.key_value.key", "nested_attrs.key_value.value.key_value.key", "4", "4", "4", "4", "3", "3", "1", "0", "7", "6"])
+        run([str(ZIG_NESTED_MAP_PAIR), str(path), "nested_attrs.key_value.value.key_value.key", "nested_attrs.key_value.value.key_value.value", "4", "4", "3", "3", "3", "3", "1", "0", "6", "2"])
+        run([str(ZIG_NESTED_LOGICAL), str(path), "list_attrs.list.element.key_value.key", "4", "4,3", "1,1", "3", "3", "0", "4"])
+        run([str(ZIG_NESTED_LOGICAL), str(path), "list_attrs.list.element.key_value.value", "4", "4,3", "1,1", "3", "2", "1", "4"])
+        run([str(ZIG_NESTED_MAP_PAIR), str(path), "list_attrs.list.element.key_value.key", "list_attrs.list.element.key_value.value", "4", "4", "3", "3", "3", "2", "1", "1", "4", "4"])
 
     run([str(ZIG_SEQUENCE_WRITER), str(zig_sequence_uncompressed), "20000", "uncompressed", "20000", "512"])
     run([str(ZIG_SEQUENCE_WRITER), str(zig_sequence_zstd), "20000", "zstd", "20000", "512"])
@@ -208,8 +461,18 @@ def main() -> int:
     validate_sequence_file(zig_sequence_zstd_delta_len, 20000)
     validate_sequence_file(zig_sequence_zstd_delta_ba, 20000)
     validate_sequence_file(zig_sequence_zstd_delta_bss, 20000)
+    for path in (
+        zig_sequence_zstd,
+        zig_sequence_zstd_bss,
+        zig_sequence_zstd_delta,
+        zig_sequence_zstd_delta_len,
+        zig_sequence_zstd_delta_ba,
+        zig_sequence_zstd_delta_bss,
+    ):
+        verify_zstd_fast_path(path)
 
     run([str(ZIG_SEQUENCE_WRITER), str(zig_sequence_v2_zstd), "20000", "zstd", "20000", "512", "v2"])
+    verify_zstd_fast_path(zig_sequence_v2_zstd)
     assert_page_indexes(zig_sequence_v2_zstd)
     zig_sequence_v2_table = pq.read_table(zig_sequence_v2_zstd)
     if zig_sequence_v2_table.column("id").to_pylist()[19999] != 19999:
@@ -225,6 +488,8 @@ def main() -> int:
         ("snappy", "v2", 3333, 257),
         ("gzip", "v1", 4096, 128),
         ("gzip", "v2", 3333, 257),
+        ("lz4_raw", "v1", 4096, 128),
+        ("lz4_raw", "v2", 3333, 257),
         ("zstd", "v1", 4096, 128),
         ("zstd", "v2", 3333, 257),
     ):
@@ -269,6 +534,7 @@ def main() -> int:
         data_page_version="1.0",
         row_group_size=3,
     )
+    verify_zstd_fast_path(pyarrow_zstd)
     run([str(ZIG_READER), str(pyarrow_zstd)])
 
     pq.write_table(
@@ -280,6 +546,16 @@ def main() -> int:
         row_group_size=3,
     )
     run([str(ZIG_READER), str(pyarrow_gzip)])
+
+    pq.write_table(
+        pyarrow_table,
+        pyarrow_lz4,
+        compression="LZ4",
+        use_dictionary=False,
+        data_page_version="1.0",
+        row_group_size=3,
+    )
+    run([str(ZIG_READER), str(pyarrow_lz4)])
 
     pq.write_table(
         pyarrow_table,
@@ -299,6 +575,7 @@ def main() -> int:
         data_page_version="2.0",
         row_group_size=3,
     )
+    verify_zstd_fast_path(pyarrow_v2_zstd)
     run([str(ZIG_READER), str(pyarrow_v2_zstd)])
 
     pq.write_table(
@@ -310,6 +587,16 @@ def main() -> int:
         row_group_size=3,
     )
     run([str(ZIG_READER), str(pyarrow_v2_gzip)])
+
+    pq.write_table(
+        pyarrow_table,
+        pyarrow_v2_lz4,
+        compression="LZ4",
+        use_dictionary=False,
+        data_page_version="2.0",
+        row_group_size=3,
+    )
+    run([str(ZIG_READER), str(pyarrow_v2_lz4)])
 
     temporal_rows = 1024
     temporal_table = pa.table(
@@ -465,6 +752,8 @@ def main() -> int:
 
     pyarrow_large_zstd = TMP / "pyarrow_large_zstd.parquet"
     pyarrow_large_gzip = TMP / "pyarrow_large_gzip.parquet"
+    pyarrow_large_lz4 = TMP / "pyarrow_large_lz4.parquet"
+    pyarrow_multi_rg_zstd_dictionary = TMP / "pyarrow_multi_rg_zstd_dictionary.parquet"
     pq.write_table(
         large_table,
         pyarrow_large_zstd,
@@ -474,7 +763,23 @@ def main() -> int:
         data_page_size=512,
         row_group_size=large_rows,
     )
+    verify_zstd_fast_path(pyarrow_large_zstd)
     run([str(ZIG_SEQUENCE), str(pyarrow_large_zstd), str(large_rows)])
+    pq.write_table(
+        large_table,
+        pyarrow_multi_rg_zstd_dictionary,
+        compression="ZSTD",
+        use_dictionary=True,
+        data_page_version="1.0",
+        data_page_size=512,
+        row_group_size=4096,
+    )
+    if pq.ParquetFile(pyarrow_multi_rg_zstd_dictionary).metadata.num_row_groups < 2:
+        raise AssertionError("PyArrow multi-row-group dictionary fixture did not split row groups")
+    verify_zstd_fast_path(pyarrow_multi_rg_zstd_dictionary)
+    run([str(ZIG_SEQUENCE), str(pyarrow_multi_rg_zstd_dictionary), str(large_rows)])
+    run([str(ZIG_IDS), str(pyarrow_multi_rg_zstd_dictionary), str(large_rows)])
+    run_quiet([str(ZIG_BENCH_READER), str(pyarrow_multi_rg_zstd_dictionary), str(large_rows), "score", "3", "no-cache"])
     pq.write_table(
         large_table,
         pyarrow_large_gzip,
@@ -485,6 +790,18 @@ def main() -> int:
         row_group_size=large_rows,
     )
     run([str(ZIG_SEQUENCE), str(pyarrow_large_gzip), str(large_rows)])
+    run_quiet([str(ZIG_BENCH_READER), str(pyarrow_large_gzip), str(large_rows), "score", "3", "no-cache"])
+    pq.write_table(
+        large_table,
+        pyarrow_large_lz4,
+        compression="LZ4",
+        use_dictionary=True,
+        data_page_version="1.0",
+        data_page_size=512,
+        row_group_size=large_rows,
+    )
+    run([str(ZIG_SEQUENCE), str(pyarrow_large_lz4), str(large_rows)])
+    run_quiet([str(ZIG_BENCH_READER), str(pyarrow_large_lz4), str(large_rows), "score", "3", "no-cache"])
     print("pyarrow-compat-ok")
     return 0
 

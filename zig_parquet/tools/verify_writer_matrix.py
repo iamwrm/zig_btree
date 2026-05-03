@@ -108,7 +108,7 @@ def main() -> int:
         raise FileNotFoundError(f"{ZIG_WRITER} does not exist; run zig build -Doptimize=ReleaseFast first")
     TMP.mkdir(parents=True, exist_ok=True)
 
-    codecs = ["uncompressed", "snappy", "gzip", "zstd"]
+    codecs = ["uncompressed", "snappy", "gzip", "lz4_raw", "zstd"]
     page_versions = ["v1", "v2"]
     encodings = [
         "plain",

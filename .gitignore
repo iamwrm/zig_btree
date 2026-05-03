@@ -9,6 +9,7 @@ zig-out/
 # Local toolchains and downloaded reference dependencies
 .toolchains/
 .deps/
+deps/
 
 # Editor and OS noise
 .DS_Store
@@ -21,3 +22,4 @@ Thumbs.db
 zig_btree.tar.gz
 zig_parquet/tmp/
 __pycache__/
+perf.data

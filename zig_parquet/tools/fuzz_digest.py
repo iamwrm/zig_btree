@@ -117,6 +117,30 @@ def run_zig_digest(path: pathlib.Path) -> tuple[int, str]:
     return rows, digest
 
 
+def case_label(
+    case: int,
+    rows: int,
+    selected: list[str],
+    null_rate: float,
+    compression: str,
+    data_page_version: str,
+    use_dictionary: bool,
+    use_byte_stream_split: bool,
+    use_delta_binary: bool,
+    use_delta_length: bool,
+    use_delta_byte_array: bool,
+    row_group_size: int,
+    data_page_size: int,
+) -> str:
+    return (
+        f"case={case} rows={rows} columns={selected} null_rate={null_rate} "
+        f"compression={compression} page={data_page_version} dict={use_dictionary} "
+        f"bss={use_byte_stream_split} delta={use_delta_binary} "
+        f"delta_len={use_delta_length} delta_ba={use_delta_byte_array} "
+        f"row_group={row_group_size} page_size={data_page_size}"
+    )
+
+
 def maybe_null(rng: random.Random, value, null_rate: float):
     return None if rng.random() < null_rate else value
 
@@ -190,7 +214,7 @@ def main() -> int:
         if not selected:
             selected = [rng.choice(names)]
         null_rate = rng.choice([0.0, 0.05, 0.25, 0.8])
-        compression = rng.choice(["NONE", "SNAPPY", "GZIP", "ZSTD"])
+        compression = rng.choice(["NONE", "SNAPPY", "GZIP", "LZ4", "ZSTD"])
         data_page_version = rng.choice(["1.0", "2.0"])
         use_dictionary = rng.choice([False, True])
         row_group_size = rng.choice([1, 3, 17, 128, rows])
@@ -246,15 +270,31 @@ def main() -> int:
 
         pyarrow_table = pq.read_table(path)
         expected = digest_table(pyarrow_table)
-        actual_rows, actual = run_zig_digest(path)
+        label = case_label(
+            case,
+            rows,
+            selected,
+            null_rate,
+            compression,
+            data_page_version,
+            use_dictionary,
+            use_byte_stream_split,
+            use_delta_binary,
+            use_delta_length,
+            use_delta_byte_array,
+            row_group_size,
+            data_page_size,
+        )
+        try:
+            actual_rows, actual = run_zig_digest(path)
+        except subprocess.CalledProcessError as exc:
+            raise AssertionError(
+                f"parquet_digest failed {label}: "
+                f"stdout={exc.stdout!r} stderr={exc.stderr!r}"
+            ) from exc
         if actual_rows != pyarrow_table.num_rows or actual != expected:
             raise AssertionError(
-                f"digest mismatch case={case} rows={rows} columns={selected} "
-                f"compression={compression} page={data_page_version} dict={use_dictionary} "
-                f"bss={use_byte_stream_split} delta={use_delta_binary} "
-                f"delta_len={use_delta_length} delta_ba={use_delta_byte_array} "
-                f"row_group={row_group_size} page_size={data_page_size}: "
-                f"{actual_rows=} {actual=} expected={expected}"
+                f"digest mismatch {label}: {actual_rows=} {actual=} expected={expected}"
             )
 
     print(f"fuzz-digest-ok cases={cases}")
