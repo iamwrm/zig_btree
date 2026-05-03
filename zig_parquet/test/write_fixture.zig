@@ -9,6 +9,10 @@ pub fn main(init: std.process.Init) !void {
     const page_version_arg = args.next() orelse "v1";
     const codec: parquet.CompressionCodec = if (std.mem.eql(u8, codec_arg, "uncompressed"))
         .uncompressed
+    else if (std.mem.eql(u8, codec_arg, "snappy"))
+        .snappy
+    else if (std.mem.eql(u8, codec_arg, "gzip"))
+        .gzip
     else if (std.mem.eql(u8, codec_arg, "zstd"))
         .zstd
     else

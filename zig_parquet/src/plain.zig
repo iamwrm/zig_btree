@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("types.zig");
+const native_endian = @import("builtin").target.cpu.arch.endian();
 
 pub fn encodeDefinitionLevels(allocator: std.mem.Allocator, writer: *std.Io.Writer, validity: []const bool) !void {
     var body: std.Io.Writer.Allocating = .init(allocator);
@@ -99,6 +100,48 @@ pub fn encodeByteStreamSplitValues(writer: *std.Io.Writer, data: types.ColumnDat
         .fixed_len_byte_array => |d| try encodeByteStreamSplitFixedBytes(writer, d.values, try types.physicalTypeWidth(column_type.physical, column_type.type_length)),
         else => return error.UnsupportedEncoding,
     }
+}
+
+pub fn encodeDeltaBinaryPackedValues(writer: *std.Io.Writer, data: types.ColumnData, column_type: types.ColumnType) !void {
+    _ = column_type;
+    switch (data) {
+        .int32 => |d| try encodeDeltaBinaryPackedInts(i32, writer, d.values),
+        .int64 => |d| try encodeDeltaBinaryPackedInts(i64, writer, d.values),
+        else => return error.UnsupportedEncoding,
+    }
+}
+
+pub fn encodeDeltaLengthByteArrayValues(allocator: std.mem.Allocator, writer: *std.Io.Writer, data: types.ColumnData, column_type: types.ColumnType) !void {
+    _ = column_type;
+    switch (data) {
+        .byte_array => |d| try encodeDeltaLengthByteArrays(allocator, writer, d.values),
+        else => return error.UnsupportedEncoding,
+    }
+}
+
+pub fn encodeDeltaByteArrayValues(allocator: std.mem.Allocator, writer: *std.Io.Writer, data: types.ColumnData, column_type: types.ColumnType) !void {
+    switch (data) {
+        .byte_array => |d| try encodeDeltaByteArrays(allocator, writer, d.values, null),
+        .fixed_len_byte_array => |d| try encodeDeltaByteArrays(allocator, writer, d.values, try types.physicalTypeWidth(column_type.physical, column_type.type_length)),
+        else => return error.UnsupportedEncoding,
+    }
+}
+
+pub fn encodeRleBooleanValues(allocator: std.mem.Allocator, writer: *std.Io.Writer, data: types.ColumnData, column_type: types.ColumnType) !void {
+    _ = column_type;
+    const values = switch (data) {
+        .boolean => |d| d.values,
+        else => return error.UnsupportedEncoding,
+    };
+
+    const ints = try allocator.alloc(u32, values.len);
+    defer allocator.free(ints);
+    for (values, ints) |value, *int_value| int_value.* = if (value) 1 else 0;
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+    try encodeRleBitPackedUint32(&body.writer, ints, 1);
+    try writer.writeInt(u32, @intCast(body.written().len), .little);
+    try writer.writeAll(body.written());
 }
 
 pub fn decodeValues(
@@ -238,21 +281,172 @@ pub fn decodeRleBitPackedUint32(allocator: std.mem.Allocator, data: []const u8, 
         } else {
             const group_count = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
             const total = std.math.mul(usize, group_count, 8) catch return error.CorruptPage;
-            var bit_pos: usize = 0;
             const bit_len = std.math.mul(usize, total, @as(usize, bit_width)) catch return error.CorruptPage;
             const byte_len = try ceilDiv8(bit_len);
             if (byte_len > data.len - pos) return error.CorruptPage;
-            var j: usize = 0;
-            while (j < total and idx < count) : (j += 1) {
-                values[idx] = readPackedValue(data[pos..][0..byte_len], bit_pos, bit_width);
-                bit_pos += bit_width;
-                idx += 1;
+
+            const decode_count = @min(total, count - idx);
+            if (!decodePackedRunFast(values[idx..][0..decode_count], data[pos..][0..byte_len], bit_width)) {
+                var bit_pos: usize = 0;
+                var j: usize = 0;
+                while (j < total and idx < count) : (j += 1) {
+                    values[idx] = readPackedValue(data[pos..][0..byte_len], bit_pos, bit_width);
+                    bit_pos += bit_width;
+                    idx += 1;
+                }
+            } else {
+                idx += decode_count;
             }
             pos += byte_len;
         }
     }
     if (idx != count) return error.CorruptPage;
     return values;
+}
+
+pub fn rleBitPackedUint32Identity(data: []const u8, bit_width: u8, count: usize) !bool {
+    return rleBitPackedUint32IdentityFrom(data, bit_width, count, 0);
+}
+
+pub fn rleBitPackedUint32IdentityFrom(data: []const u8, bit_width: u8, count: usize, start: usize) !bool {
+    if (bit_width > 32) return error.CorruptPage;
+    if (bit_width == 0) return start == 0 and count <= 1;
+
+    const width_bytes = (@as(usize, bit_width) + 7) / 8;
+    var pos: usize = 0;
+    var idx: usize = 0;
+    while (pos < data.len and idx < count) {
+        const header = try readVarUint(data, &pos, data.len);
+        if ((header & 1) == 0) {
+            const run_len = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
+            if (width_bytes > data.len - pos) return error.CorruptPage;
+            var value: u32 = 0;
+            var b: usize = 0;
+            while (b < width_bytes) : (b += 1) value |= @as(u32, data[pos + b]) << @intCast(8 * b);
+            pos += width_bytes;
+            if (run_len > count - idx) return error.CorruptPage;
+            var run_idx: usize = 0;
+            while (run_idx < run_len) : (run_idx += 1) {
+                const expected = std.math.cast(u32, start + idx + run_idx) orelse return false;
+                if (value != expected) return false;
+            }
+            idx += run_len;
+        } else {
+            const group_count = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
+            const total = std.math.mul(usize, group_count, 8) catch return error.CorruptPage;
+            const bit_len = std.math.mul(usize, total, @as(usize, bit_width)) catch return error.CorruptPage;
+            const byte_len = try ceilDiv8(bit_len);
+            if (byte_len > data.len - pos) return error.CorruptPage;
+
+            const decode_count = @min(total, count - idx);
+            if (!packedRunIsIdentity(data[pos..][0..byte_len], bit_width, start + idx, decode_count)) return false;
+            idx += decode_count;
+            pos += byte_len;
+        }
+    }
+    if (idx != count) return error.CorruptPage;
+    return true;
+}
+
+fn decodePackedRunFast(dest: []u32, data: []const u8, bit_width: u8) bool {
+    switch (bit_width) {
+        1 => {
+            for (dest, 0..) |*value, i| {
+                value.* = @intCast((data[i / 8] >> @intCast(i & 7)) & 1);
+            }
+            return true;
+        },
+        8 => {
+            for (dest, data[0..dest.len]) |*value, byte| value.* = byte;
+            return true;
+        },
+        16 => {
+            for (dest, 0..) |*value, i| {
+                const offset = i * 2;
+                value.* = @as(u32, data[offset]) |
+                    (@as(u32, data[offset + 1]) << 8);
+            }
+            return true;
+        },
+        24 => {
+            for (dest, 0..) |*value, i| {
+                const offset = i * 3;
+                value.* = @as(u32, data[offset]) |
+                    (@as(u32, data[offset + 1]) << 8) |
+                    (@as(u32, data[offset + 2]) << 16);
+            }
+            return true;
+        },
+        32 => {
+            const bytes = dest.len * 4;
+            if (native_endian == .little) {
+                @memcpy(std.mem.sliceAsBytes(dest), data[0..bytes]);
+            } else {
+                for (dest, 0..) |*value, i| value.* = std.mem.readInt(u32, data[i * 4 ..][0..4], .little);
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+fn packedRunIsIdentity(data: []const u8, bit_width: u8, start: usize, count: usize) bool {
+    switch (bit_width) {
+        1 => {
+            for (0..count) |i| {
+                const value = (data[i / 8] >> @intCast(i & 7)) & 1;
+                const expected = std.math.cast(u32, start + i) orelse return false;
+                if (value != expected) return false;
+            }
+            return true;
+        },
+        8 => {
+            for (data[0..count], 0..) |value, i| {
+                const expected = std.math.cast(u32, start + i) orelse return false;
+                if (value != expected) return false;
+            }
+            return true;
+        },
+        16 => {
+            for (0..count) |i| {
+                const offset = i * 2;
+                const value = @as(u32, data[offset]) |
+                    (@as(u32, data[offset + 1]) << 8);
+                const expected = std.math.cast(u32, start + i) orelse return false;
+                if (value != expected) return false;
+            }
+            return true;
+        },
+        24 => {
+            for (0..count) |i| {
+                const offset = i * 3;
+                const value = @as(u32, data[offset]) |
+                    (@as(u32, data[offset + 1]) << 8) |
+                    (@as(u32, data[offset + 2]) << 16);
+                const expected = std.math.cast(u32, start + i) orelse return false;
+                if (value != expected) return false;
+            }
+            return true;
+        },
+        32 => {
+            for (0..count) |i| {
+                const value = std.mem.readInt(u32, data[i * 4 ..][0..4], .little);
+                const expected = std.math.cast(u32, start + i) orelse return false;
+                if (value != expected) return false;
+            }
+            return true;
+        },
+        else => {
+            var bit_pos: usize = 0;
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const expected = std.math.cast(u32, start + i) orelse return false;
+                if (readPackedValue(data, bit_pos, bit_width) != expected) return false;
+                bit_pos += bit_width;
+            }
+            return true;
+        },
+    }
 }
 
 pub fn materializeDictionary(
@@ -407,7 +601,11 @@ fn decodeFixed(comptime T: type, allocator: std.mem.Allocator, count: usize, val
     if (data.len < bytes) return error.CorruptPage;
     const values = try allocator.alloc(T, count);
     errdefer allocator.free(values);
-    for (values, 0..) |*value, i| value.* = std.mem.readInt(T, data[i * @sizeOf(T) ..][0..@sizeOf(T)], .little);
+    if (native_endian == .little) {
+        @memcpy(std.mem.sliceAsBytes(values), data[0..bytes]);
+    } else {
+        for (values, 0..) |*value, i| value.* = std.mem.readInt(T, data[i * @sizeOf(T) ..][0..@sizeOf(T)], .little);
+    }
     return .{ .values = values, .validity = validity };
 }
 
@@ -416,7 +614,11 @@ fn decodeFloats(allocator: std.mem.Allocator, count: usize, validity: ?[]bool, d
     if (data.len < bytes) return error.CorruptPage;
     const values = try allocator.alloc(f32, count);
     errdefer allocator.free(values);
-    for (values, 0..) |*value, i| value.* = @bitCast(std.mem.readInt(u32, data[i * 4 ..][0..4], .little));
+    if (native_endian == .little) {
+        @memcpy(std.mem.sliceAsBytes(values), data[0..bytes]);
+    } else {
+        for (values, 0..) |*value, i| value.* = @bitCast(std.mem.readInt(u32, data[i * 4 ..][0..4], .little));
+    }
     return .{ .values = values, .validity = validity };
 }
 
@@ -425,7 +627,11 @@ fn decodeDoubles(allocator: std.mem.Allocator, count: usize, validity: ?[]bool, 
     if (data.len < bytes) return error.CorruptPage;
     const values = try allocator.alloc(f64, count);
     errdefer allocator.free(values);
-    for (values, 0..) |*value, i| value.* = @bitCast(std.mem.readInt(u64, data[i * 8 ..][0..8], .little));
+    if (native_endian == .little) {
+        @memcpy(std.mem.sliceAsBytes(values), data[0..bytes]);
+    } else {
+        for (values, 0..) |*value, i| value.* = @bitCast(std.mem.readInt(u64, data[i * 8 ..][0..8], .little));
+    }
     return .{ .values = values, .validity = validity };
 }
 
@@ -459,6 +665,144 @@ fn encodeByteStreamSplitFixedBytes(writer: *std.Io.Writer, values: []const []con
             try writer.writeByte(value[byte_idx]);
         }
     }
+}
+
+const delta_block_size = 128;
+const delta_miniblocks_per_block = 4;
+const delta_miniblock_values = delta_block_size / delta_miniblocks_per_block;
+
+fn encodeDeltaBinaryPackedInts(comptime T: type, writer: *std.Io.Writer, values: []const T) !void {
+    try writeVarUint(writer, delta_block_size);
+    try writeVarUint(writer, delta_miniblocks_per_block);
+    try writeVarUint(writer, values.len);
+    if (values.len == 0) return;
+
+    var previous: i64 = @intCast(values[0]);
+    try writeZigZagInt(writer, previous);
+
+    var value_idx: usize = 1;
+    while (value_idx < values.len) {
+        var deltas: [delta_block_size]i64 = undefined;
+        var adjusted: [delta_block_size]u64 = undefined;
+        var block_count: usize = 0;
+        var min_delta: i64 = std.math.maxInt(i64);
+
+        while (block_count < delta_block_size and value_idx < values.len) : (block_count += 1) {
+            const current: i64 = @intCast(values[value_idx]);
+            const delta = try checkedDelta(current, previous);
+            deltas[block_count] = delta;
+            min_delta = @min(min_delta, delta);
+            previous = current;
+            value_idx += 1;
+        }
+
+        try writeZigZagInt(writer, min_delta);
+
+        var idx: usize = 0;
+        while (idx < block_count) : (idx += 1) {
+            adjusted[idx] = try adjustedDelta(deltas[idx], min_delta);
+        }
+        while (idx < delta_block_size) : (idx += 1) {
+            adjusted[idx] = 0;
+        }
+
+        var bit_widths: [delta_miniblocks_per_block]u8 = .{0} ** delta_miniblocks_per_block;
+        var mini_idx: usize = 0;
+        while (mini_idx < delta_miniblocks_per_block) : (mini_idx += 1) {
+            const start = mini_idx * delta_miniblock_values;
+            var max_adjusted: u64 = 0;
+            for (adjusted[start..][0..delta_miniblock_values]) |value| max_adjusted = @max(max_adjusted, value);
+            bit_widths[mini_idx] = bitWidth64(max_adjusted);
+        }
+        try writer.writeAll(bit_widths[0..]);
+
+        mini_idx = 0;
+        while (mini_idx < delta_miniblocks_per_block) : (mini_idx += 1) {
+            const start = mini_idx * delta_miniblock_values;
+            try writePackedValues64(writer, adjusted[start..][0..delta_miniblock_values], bit_widths[mini_idx]);
+        }
+    }
+}
+
+fn encodeDeltaLengthByteArrays(allocator: std.mem.Allocator, writer: *std.Io.Writer, values: []const []const u8) !void {
+    const lengths = try allocator.alloc(i32, values.len);
+    defer allocator.free(lengths);
+
+    for (values, lengths) |value, *length| {
+        length.* = std.math.cast(i32, value.len) orelse return error.InvalidColumnData;
+    }
+
+    try encodeDeltaBinaryPackedInts(i32, writer, lengths);
+    for (values) |value| try writer.writeAll(value);
+}
+
+fn encodeDeltaByteArrays(allocator: std.mem.Allocator, writer: *std.Io.Writer, values: []const []const u8, fixed_width: ?usize) !void {
+    const prefix_lengths = try allocator.alloc(i32, values.len);
+    defer allocator.free(prefix_lengths);
+    const suffixes = try allocator.alloc([]const u8, values.len);
+    defer allocator.free(suffixes);
+
+    var previous: []const u8 = "";
+    for (values, prefix_lengths, suffixes) |value, *prefix_len, *suffix| {
+        if (fixed_width) |expected| {
+            if (value.len != expected) return error.InvalidColumnData;
+        }
+        const common = commonPrefixLen(previous, value);
+        prefix_len.* = std.math.cast(i32, common) orelse return error.InvalidColumnData;
+        suffix.* = value[common..];
+        previous = value;
+    }
+
+    try encodeDeltaBinaryPackedInts(i32, writer, prefix_lengths);
+    try encodeDeltaLengthByteArrays(allocator, writer, suffixes);
+}
+
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const max_len = @min(a.len, b.len);
+    var idx: usize = 0;
+    while (idx < max_len and a[idx] == b[idx]) : (idx += 1) {}
+    return idx;
+}
+
+fn checkedDelta(current: i64, previous: i64) !i64 {
+    const wide = @as(i128, current) - @as(i128, previous);
+    return std.math.cast(i64, wide) orelse error.InvalidColumnData;
+}
+
+fn adjustedDelta(delta: i64, min_delta: i64) !u64 {
+    const wide = @as(i128, delta) - @as(i128, min_delta);
+    if (wide < 0) return error.InvalidColumnData;
+    return std.math.cast(u64, wide) orelse error.InvalidColumnData;
+}
+
+fn bitWidth64(value: u64) u8 {
+    if (value == 0) return 0;
+    return @intCast(@bitSizeOf(u64) - @clz(value));
+}
+
+fn writePackedValues64(writer: *std.Io.Writer, values: []const u64, bit_width: u8) !void {
+    if (bit_width > 64) return error.InvalidColumnData;
+    if (bit_width == 0) return;
+
+    var current_byte: u8 = 0;
+    var bits_in_byte: u8 = 0;
+    for (values) |value| {
+        if (bit_width < 64 and value >= (@as(u64, 1) << @as(u6, @intCast(bit_width)))) return error.InvalidColumnData;
+
+        var bit: u8 = 0;
+        while (bit < bit_width) : (bit += 1) {
+            if (((value >> @as(u6, @intCast(bit))) & 1) != 0) {
+                current_byte |= @as(u8, 1) << @as(u3, @intCast(bits_in_byte));
+            }
+            bits_in_byte += 1;
+            if (bits_in_byte == 8) {
+                try writer.writeByte(current_byte);
+                current_byte = 0;
+                bits_in_byte = 0;
+            }
+        }
+    }
+    if (bits_in_byte != 0) try writer.writeByte(current_byte);
 }
 
 fn decodeByteStreamSplitInts(comptime T: type, allocator: std.mem.Allocator, count: usize, validity: ?[]bool, data: []const u8) !switch (T) {
@@ -535,8 +879,16 @@ fn decodeDeltaBinaryPackedIntSlice(comptime T: type, allocator: std.mem.Allocato
     const values = try allocator.alloc(T, count);
     errdefer allocator.free(values);
     if (count == 0) {
-        if (data.len != 0) return error.CorruptPage;
-        return .{ .values = values, .consumed = 0 };
+        var pos: usize = 0;
+        const block_size = std.math.cast(usize, try readVarUint(data, &pos, data.len)) orelse return error.CorruptPage;
+        const miniblocks_per_block = std.math.cast(usize, try readVarUint(data, &pos, data.len)) orelse return error.CorruptPage;
+        const total_value_count = std.math.cast(usize, try readVarUint(data, &pos, data.len)) orelse return error.CorruptPage;
+        if (block_size == 0 or block_size % 128 != 0) return error.CorruptPage;
+        if (miniblocks_per_block == 0 or block_size % miniblocks_per_block != 0) return error.CorruptPage;
+        const miniblock_values = block_size / miniblocks_per_block;
+        if (miniblock_values == 0 or miniblock_values % 32 != 0) return error.CorruptPage;
+        if (total_value_count != 0) return error.CorruptPage;
+        return .{ .values = values, .consumed = pos };
     }
 
     var pos: usize = 0;
@@ -716,12 +1068,23 @@ fn decodeFixedLenByteArrays(allocator: std.mem.Allocator, count: usize, validity
 }
 
 fn writeVarUint(writer: *std.Io.Writer, value: usize) !void {
-    var v: u64 = @intCast(value);
+    try writeVarUint64(writer, @intCast(value));
+}
+
+fn writeVarUint64(writer: *std.Io.Writer, value: u64) !void {
+    var v = value;
     while (v >= 0x80) {
         try writer.writeByte(@as(u8, @intCast(v & 0x7f)) | 0x80);
         v >>= 7;
     }
     try writer.writeByte(@intCast(v));
+}
+
+fn writeZigZagInt(writer: *std.Io.Writer, value: i64) !void {
+    const wide = @as(i128, value);
+    const encoded_wide = (wide << 1) ^ (wide >> 63);
+    if (encoded_wide < 0) return error.InvalidColumnData;
+    try writeVarUint64(writer, std.math.cast(u64, encoded_wide) orelse return error.InvalidColumnData);
 }
 
 fn readVarUint(data: []const u8, pos: *usize, end: usize) !u64 {
@@ -801,4 +1164,125 @@ test "byte stream split round-trips fixed width values" {
     var id_decoded = try decodeByteStreamSplitValues(testing.allocator, .{ .physical = .int32 }, ids.len, ids.len, null, id_out.written());
     defer id_decoded.deinit(testing.allocator);
     try testing.expectEqualSlices(i32, ids[0..], id_decoded.int32.values);
+}
+
+test "boolean rle values round-trip" {
+    const testing = std.testing;
+    const values = [_]bool{ true, false, false, true, true, true, false, false, true, false, true, true, false, true, false, false, true };
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try encodeRleBooleanValues(testing.allocator, &out.writer, .{ .boolean = .{ .values = values[0..] } }, .{ .physical = .boolean });
+
+    const payload_len = std.mem.readInt(u32, out.written()[0..4], .little);
+    try testing.expectEqual(out.written().len - 4, @as(usize, payload_len));
+    const decoded = try decodeRleBitPackedUint32(testing.allocator, out.written()[4..], 1, values.len);
+    defer testing.allocator.free(decoded);
+    for (values, decoded) |expected, actual| {
+        try testing.expectEqual(expected, actual != 0);
+    }
+}
+
+test "bit-packed dictionary indexes decode byte-aligned run" {
+    const testing = std.testing;
+    const expected = [_]u32{ 0, 1, 7, 255, 256, 1024, 4096, 65535, 3, 5, 8, 13, 21 };
+    const padded = expected ++ [_]u32{ 34, 55, 89 };
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeVarUint(&out.writer, (2 << 1) | 1);
+    for (padded) |value| try out.writer.writeInt(u16, @intCast(value), .little);
+
+    const decoded = try decodeRleBitPackedUint32(testing.allocator, out.written(), 16, expected.len);
+    defer testing.allocator.free(decoded);
+    try testing.expectEqualSlices(u32, expected[0..], decoded);
+    try testing.expect(!(try rleBitPackedUint32Identity(out.written(), 16, expected.len)));
+
+    var identity_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer identity_out.deinit();
+    try writeVarUint(&identity_out.writer, (2 << 1) | 1);
+    for (0..16) |value| try identity_out.writer.writeInt(u16, @intCast(value), .little);
+    try testing.expect(try rleBitPackedUint32Identity(identity_out.written(), 16, 13));
+
+    var offset_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer offset_out.deinit();
+    try writeVarUint(&offset_out.writer, (2 << 1) | 1);
+    for (8..24) |value| try offset_out.writer.writeInt(u16, @intCast(value), .little);
+    try testing.expect(try rleBitPackedUint32IdentityFrom(offset_out.written(), 16, 13, 8));
+}
+
+test "delta binary packed round-trips integer values" {
+    const testing = std.testing;
+
+    var ids: [260]i64 = undefined;
+    for (&ids, 0..) |*value, i| {
+        const base: i64 = @intCast(i);
+        value.* = base * 17 - @as(i64, @intCast(i % 11)) * 3;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try encodeDeltaBinaryPackedValues(&out.writer, .{ .int64 = .{ .values = ids[0..] } }, .{ .physical = .int64 });
+
+    var decoded = try decodeDeltaBinaryPackedValues(testing.allocator, .{ .physical = .int64 }, ids.len, ids.len, null, out.written());
+    defer decoded.deinit(testing.allocator);
+    try testing.expectEqualSlices(i64, ids[0..], decoded.int64.values);
+
+    const small = [_]i32{ -15, -12, -12, 8, 1024, 17, -2048 };
+    var small_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer small_out.deinit();
+    try encodeDeltaBinaryPackedValues(&small_out.writer, .{ .int32 = .{ .values = small[0..] } }, .{ .physical = .int32 });
+
+    var small_decoded = try decodeDeltaBinaryPackedValues(testing.allocator, .{ .physical = .int32 }, small.len, small.len, null, small_out.written());
+    defer small_decoded.deinit(testing.allocator);
+    try testing.expectEqualSlices(i32, small[0..], small_decoded.int32.values);
+
+    var empty_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer empty_out.deinit();
+    try encodeDeltaBinaryPackedValues(&empty_out.writer, .{ .int32 = .{ .values = &.{} } }, .{ .physical = .int32 });
+
+    var empty_decoded = try decodeDeltaBinaryPackedValues(testing.allocator, .{ .physical = .int32 }, 0, 0, null, empty_out.written());
+    defer empty_decoded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), empty_decoded.int32.values.len);
+}
+
+test "delta byte array encodings round-trip byte arrays" {
+    const testing = std.testing;
+    const values = [_][]const u8{
+        "prefix-000001-suffix",
+        "prefix-000002-suffix",
+        "prefix-000002-tail",
+        "prefix-000120-tail",
+        "other",
+    };
+
+    var length_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer length_out.deinit();
+    try encodeDeltaLengthByteArrayValues(testing.allocator, &length_out.writer, .{ .byte_array = .{ .values = values[0..] } }, .{ .physical = .byte_array });
+
+    var length_decoded = try decodeDeltaLengthByteArrayValues(testing.allocator, .{ .physical = .byte_array }, values.len, values.len, null, length_out.written());
+    defer length_decoded.deinit(testing.allocator);
+    for (values, length_decoded.byte_array.values) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+
+    var delta_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer delta_out.deinit();
+    try encodeDeltaByteArrayValues(testing.allocator, &delta_out.writer, .{ .byte_array = .{ .values = values[0..] } }, .{ .physical = .byte_array });
+
+    var delta_decoded = try decodeDeltaByteArrayValues(testing.allocator, .{ .physical = .byte_array }, values.len, values.len, null, delta_out.written());
+    defer delta_decoded.deinit(testing.allocator);
+    for (values, delta_decoded.byte_array.values) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+
+    const fixed = [_][]const u8{ "abcd", "abce", "abzz" };
+    var fixed_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer fixed_out.deinit();
+    try encodeDeltaByteArrayValues(testing.allocator, &fixed_out.writer, .{ .fixed_len_byte_array = .{ .values = fixed[0..] } }, .{ .physical = .fixed_len_byte_array, .type_length = 4 });
+
+    var fixed_decoded = try decodeDeltaByteArrayValues(testing.allocator, .{ .physical = .fixed_len_byte_array, .type_length = 4 }, fixed.len, fixed.len, null, fixed_out.written());
+    defer fixed_decoded.deinit(testing.allocator);
+    for (fixed, fixed_decoded.fixed_len_byte_array.values) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
 }

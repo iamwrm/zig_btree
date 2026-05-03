@@ -26,6 +26,10 @@ pub fn main(init: std.process.Init) !void {
 
     const codec: parquet.CompressionCodec = if (std.mem.eql(u8, codec_arg, "uncompressed"))
         .uncompressed
+    else if (std.mem.eql(u8, codec_arg, "snappy"))
+        .snappy
+    else if (std.mem.eql(u8, codec_arg, "gzip"))
+        .gzip
     else if (std.mem.eql(u8, codec_arg, "zstd"))
         .zstd
     else
@@ -37,12 +41,15 @@ pub fn main(init: std.process.Init) !void {
         .v2
     else
         return error.InvalidColumnData;
-    const use_byte_stream_split = if (std.mem.eql(u8, value_encoding_arg, "plain"))
-        false
-    else if (std.mem.eql(u8, value_encoding_arg, "byte_stream_split"))
-        true
-    else
+    const use_byte_stream_split = std.mem.eql(u8, value_encoding_arg, "byte_stream_split") or
+        std.mem.eql(u8, value_encoding_arg, "delta_binary_packed+byte_stream_split");
+    const use_delta_binary_packed = std.mem.eql(u8, value_encoding_arg, "delta_binary_packed") or
+        std.mem.eql(u8, value_encoding_arg, "delta_binary_packed+byte_stream_split");
+    const use_delta_length_byte_array = std.mem.eql(u8, value_encoding_arg, "delta_length_byte_array");
+    const use_delta_byte_array = std.mem.eql(u8, value_encoding_arg, "delta_byte_array");
+    if (!std.mem.eql(u8, value_encoding_arg, "plain") and !use_byte_stream_split and !use_delta_binary_packed and !use_delta_length_byte_array and !use_delta_byte_array) {
         return error.InvalidColumnData;
+    }
 
     var file = try std.Io.Dir.cwd().createFile(init.io, path, .{ .truncate = true });
     defer file.close(init.io);
@@ -62,6 +69,9 @@ pub fn main(init: std.process.Init) !void {
         .max_page_rows = max_page_rows,
         .data_page_version = data_page_version,
         .use_byte_stream_split = use_byte_stream_split,
+        .use_delta_binary_packed = use_delta_binary_packed,
+        .use_delta_length_byte_array = use_delta_length_byte_array,
+        .use_delta_byte_array = use_delta_byte_array,
     });
     defer writer.deinit();
     try writer.start();

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import argparse
 import hashlib
+import math
 import pathlib
 import random
 import struct
@@ -119,24 +121,38 @@ def maybe_null(rng: random.Random, value, null_rate: float):
     return None if rng.random() < null_rate else value
 
 
-def make_values(rng: random.Random, kind: str, rows: int, null_rate: float) -> list:
+def make_values(rng: random.Random, kind: str, rows: int, null_rate: float, allow_i64_extremes: bool) -> list:
     values = []
     words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"]
     for i in range(rows):
         if kind == "bool":
             value = (i + rng.randrange(3)) % 3 == 0
         elif kind == "int32":
-            value = (i % 97) - 48 if rng.random() < 0.7 else rng.randint(-(2**30), 2**30 - 1)
+            edge = [-(2**31), -1, 0, 1, 2**31 - 1]
+            value = edge[i % len(edge)] if i % 29 == 0 else ((i % 97) - 48 if rng.random() < 0.7 else rng.randint(-(2**30), 2**30 - 1))
         elif kind == "int64":
-            value = i * 17 - 12345 if rng.random() < 0.7 else rng.randint(-(2**45), 2**45 - 1)
+            edge = [-(2**63), -1, 0, 1, 2**63 - 1]
+            value = edge[i % len(edge)] if allow_i64_extremes and i % 31 == 0 else (i * 17 - 12345 if rng.random() < 0.7 else rng.randint(-(2**45), 2**45 - 1))
         elif kind == "float32":
-            value = (i % 101) * 0.5 - 17.25
+            edge = [0.0, -0.0, math.inf, -math.inf, math.nan]
+            value = edge[i % len(edge)] if i % 37 == 0 else (i % 101) * 0.5 - 17.25
         elif kind == "float64":
-            value = i * 0.125 - 99.5
+            edge = [0.0, -0.0, math.inf, -math.inf, math.nan]
+            value = edge[i % len(edge)] if i % 41 == 0 else i * 0.125 - 99.5
         elif kind == "string":
-            value = words[(i + rng.randrange(len(words))) & (len(words) - 1)]
+            if i % 23 == 0:
+                value = ""
+            elif i % 31 == 0:
+                value = f"prefix-{i // 3:06d}-" + ("x" * 96)
+            else:
+                value = f"prefix-{i // 3:06d}-{words[(i + rng.randrange(len(words))) & (len(words) - 1)]}"
         elif kind == "binary":
-            n = rng.randrange(0, 12)
+            if i % 19 == 0:
+                n = 0
+            elif i % 29 == 0:
+                n = 257
+            else:
+                n = rng.randrange(0, 32)
             value = bytes(((i + j * 13 + rng.randrange(17)) & 0xFF) for j in range(n))
         elif kind == "fixed":
             value = bytes(((i >> (j * 2)) + j * 41) & 0xFF for j in range(4))
@@ -146,23 +162,27 @@ def make_values(rng: random.Random, kind: str, rows: int, null_rate: float) -> l
     return values
 
 
-def make_table(rng: random.Random, rows: int, names: list[str], null_rate: float) -> pa.Table:
+def make_table(rng: random.Random, rows: int, names: list[str], null_rate: float, allow_i64_extremes: bool) -> pa.Table:
     arrays = {}
     fields = []
     for name in names:
         kind, arrow_type, _physical, _logical, _type_length = TYPE_INFO[name]
-        arrays[name] = pa.array(make_values(rng, kind, rows, null_rate), type=arrow_type)
+        arrays[name] = pa.array(make_values(rng, kind, rows, null_rate, allow_i64_extremes), type=arrow_type)
         fields.append(pa.field(name, arrow_type, nullable=True))
     return pa.Table.from_arrays([arrays[name] for name in names], schema=pa.schema(fields))
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cases", type=int, default=96)
+    args = parser.parse_args()
+
     if not ZIG_DIGEST.exists():
         raise FileNotFoundError(f"{ZIG_DIGEST} does not exist; run zig build -Doptimize=ReleaseFast first")
     TMP.mkdir(parents=True, exist_ok=True)
     rng = random.Random(0x5EED)
     names = list(TYPE_INFO)
-    cases = 32
+    cases = args.cases
 
     for case in range(cases):
         rows = rng.choice([1, 2, 7, 31, 128, 513, 2048])
@@ -170,7 +190,7 @@ def main() -> int:
         if not selected:
             selected = [rng.choice(names)]
         null_rate = rng.choice([0.0, 0.05, 0.25, 0.8])
-        compression = rng.choice(["NONE", "SNAPPY", "ZSTD"])
+        compression = rng.choice(["NONE", "SNAPPY", "GZIP", "ZSTD"])
         data_page_version = rng.choice(["1.0", "2.0"])
         use_dictionary = rng.choice([False, True])
         row_group_size = rng.choice([1, 3, 17, 128, rows])
@@ -210,7 +230,7 @@ def main() -> int:
         else:
             column_encoding = None
 
-        table = make_table(rng, rows, selected, null_rate)
+        table = make_table(rng, rows, selected, null_rate, allow_i64_extremes=not use_delta_binary)
         path = TMP / f"case_{case:03d}.parquet"
         pq.write_table(
             table,

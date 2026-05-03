@@ -2,10 +2,15 @@ const std = @import("std");
 const types = @import("types.zig");
 const thrift = @import("thrift.zig");
 const plain = @import("plain.zig");
+const snappy = @import("snappy.zig");
+const gzip = @import("gzip.zig");
 const zstd = @import("zstd.zig");
 
 const page_encodings = [_]types.Encoding{ .plain, .rle };
 const byte_stream_split_page_encodings = [_]types.Encoding{ .byte_stream_split, .rle };
+const delta_binary_page_encodings = [_]types.Encoding{ .delta_binary_packed, .rle };
+const delta_length_page_encodings = [_]types.Encoding{ .delta_length_byte_array, .rle };
+const delta_byte_array_page_encodings = [_]types.Encoding{ .delta_byte_array, .rle };
 const dictionary_page_encodings = [_]types.Encoding{ .plain, .rle, .rle_dictionary };
 
 pub const DataPageVersion = enum {
@@ -20,6 +25,9 @@ pub const Options = struct {
     data_page_version: DataPageVersion = .v1,
     page_checksum: bool = false,
     use_byte_stream_split: bool = false,
+    use_delta_binary_packed: bool = false,
+    use_delta_length_byte_array: bool = false,
+    use_delta_byte_array: bool = false,
 };
 
 pub const StreamWriter = struct {
@@ -177,12 +185,19 @@ pub const StreamWriter = struct {
         }
 
         const owned_page_entries = try page_entries.toOwnedSlice(self.allocator);
+        const value_encoding = self.columnValueEncoding(column);
         return .{
             .physical_type = column.column_type.physical,
             .encodings = if (dictionary_page_offset != null)
                 &dictionary_page_encodings
-            else if (self.pageValueEncoding(column) == .byte_stream_split)
+            else if (value_encoding == .byte_stream_split)
                 &byte_stream_split_page_encodings
+            else if (value_encoding == .delta_binary_packed)
+                &delta_binary_page_encodings
+            else if (value_encoding == .delta_length_byte_array)
+                &delta_length_page_encodings
+            else if (value_encoding == .delta_byte_array)
+                &delta_byte_array_page_encodings
             else
                 &page_encodings,
             .path = column.name,
@@ -218,7 +233,7 @@ pub const StreamWriter = struct {
         if (column.repetition == .optional) {
             try plain.encodeDefinitionLevels(self.allocator, &page_body.writer, data.validity().?);
         }
-        const encoding = self.pageValueEncoding(column);
+        const encoding = self.pageValueEncoding(column, data);
         try self.encodePageValues(&page_body.writer, data, column.column_type, encoding);
 
         const body = page_body.written();
@@ -274,7 +289,7 @@ pub const StreamWriter = struct {
 
         var values_body: std.Io.Writer.Allocating = .init(self.allocator);
         defer values_body.deinit();
-        const encoding = self.pageValueEncoding(column);
+        const encoding = self.pageValueEncoding(column, data);
         try self.encodePageValues(&values_body.writer, data, column.column_type, encoding);
 
         const values = values_body.written();
@@ -494,19 +509,48 @@ pub const StreamWriter = struct {
         try plain.encodeRleBitPackedUint32(writer, indexes, bit_width);
     }
 
-    fn pageValueEncoding(self: *StreamWriter, column: types.Column) types.Encoding {
-        if (!self.options.use_byte_stream_split) return .plain;
-        return switch (column.column_type.physical) {
-            .float, .double => .byte_stream_split,
-            else => .plain,
-        };
+    fn columnValueEncoding(self: *StreamWriter, column: types.Column) types.Encoding {
+        if (column.column_type.physical == .boolean) return .rle;
+        if (self.options.use_delta_binary_packed) {
+            switch (column.column_type.physical) {
+                .int32, .int64 => return .delta_binary_packed,
+                else => {},
+            }
+        }
+        if (self.options.use_delta_byte_array) {
+            switch (column.column_type.physical) {
+                .byte_array, .fixed_len_byte_array => return .delta_byte_array,
+                else => {},
+            }
+        }
+        if (self.options.use_delta_length_byte_array) {
+            switch (column.column_type.physical) {
+                .byte_array => return .delta_length_byte_array,
+                else => {},
+            }
+        }
+        if (self.options.use_byte_stream_split) {
+            switch (column.column_type.physical) {
+                .float, .double => return .byte_stream_split,
+                else => {},
+            }
+        }
+        return .plain;
+    }
+
+    fn pageValueEncoding(self: *StreamWriter, column: types.Column, data: types.ColumnData) types.Encoding {
+        if (data.valueCount() == 0) return .plain;
+        return self.columnValueEncoding(column);
     }
 
     fn encodePageValues(self: *StreamWriter, page_writer: *std.Io.Writer, data: types.ColumnData, column_type: types.ColumnType, encoding: types.Encoding) !void {
-        _ = self;
         return switch (encoding) {
             .plain => plain.encodeValues(page_writer, data, column_type),
+            .rle => plain.encodeRleBooleanValues(self.allocator, page_writer, data, column_type),
             .byte_stream_split => plain.encodeByteStreamSplitValues(page_writer, data, column_type),
+            .delta_binary_packed => plain.encodeDeltaBinaryPackedValues(page_writer, data, column_type),
+            .delta_length_byte_array => plain.encodeDeltaLengthByteArrayValues(self.allocator, page_writer, data, column_type),
+            .delta_byte_array => plain.encodeDeltaByteArrayValues(self.allocator, page_writer, data, column_type),
             else => error.UnsupportedEncoding,
         };
     }
@@ -577,6 +621,7 @@ const ByteArrayDictionary = struct {
 
     fn build(allocator: std.mem.Allocator, options: Options, column: types.Column, data: types.ColumnData) !?ByteArrayDictionary {
         if (!options.use_dictionary or column.column_type.physical != .byte_array) return null;
+        if (options.use_delta_length_byte_array or options.use_delta_byte_array) return null;
         const values = switch (data) {
             .byte_array => |d| d.values,
             else => return null,
@@ -705,6 +750,14 @@ const EncodedPage = struct {
 fn compressPage(allocator: std.mem.Allocator, codec: types.CompressionCodec, body: []const u8) !EncodedPage {
     return switch (codec) {
         .uncompressed => .{ .data = body },
+        .snappy => blk: {
+            const compressed = try snappy.compress(allocator, body);
+            break :blk .{ .data = compressed, .owned = compressed };
+        },
+        .gzip => blk: {
+            const compressed = try gzip.compress(allocator, body);
+            break :blk .{ .data = compressed, .owned = compressed };
+        },
         .zstd => blk: {
             const compressed = try zstd.compressFrame(allocator, body);
             break :blk .{ .data = compressed, .owned = compressed };
@@ -739,7 +792,7 @@ fn validateSchema(schema: types.Schema) !void {
 fn validateOptions(options: Options) !void {
     if (options.max_page_rows == 0) return error.InvalidColumnData;
     switch (options.compression) {
-        .uncompressed, .zstd => {},
+        .uncompressed, .snappy, .gzip, .zstd => {},
         else => return error.UnsupportedCompression,
     }
 }
@@ -973,6 +1026,80 @@ test "writer creates zstd-compressed pages readable by reader" {
     try testing.expectEqualSlices(i64, ids[0..], id_col.int64.values);
 }
 
+test "writer creates snappy-compressed pages readable by reader" {
+    const testing = std.testing;
+    const reader_mod = @import("reader.zig");
+    const cols = [_]types.Column{
+        .{ .name = "id", .column_type = .{ .physical = .int64 } },
+        .{ .name = "label", .column_type = .{ .physical = .byte_array, .logical = .string }, .repetition = .optional },
+    };
+    const schema = types.Schema.init("schema", cols[0..]);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var w = StreamWriter.initOptions(testing.allocator, &out.writer, schema, .{ .compression = .snappy });
+    defer w.deinit();
+    try w.start();
+
+    const ids = [_]i64{ 10, 11, 12, 13, 14 };
+    const labels = [_][]const u8{ "prefix-000001-suffix", "prefix-000002-suffix", "prefix-000001-suffix", "prefix-000002-suffix" };
+    const validity = [_]bool{ true, false, true, true, true };
+    const batch = [_]types.ColumnData{
+        .{ .int64 = .{ .values = ids[0..] } },
+        .{ .byte_array = .{ .values = labels[0..], .validity = validity[0..] } },
+    };
+    try w.writeRowGroup(ids.len, batch[0..]);
+    try w.finish();
+
+    var parsed = try reader_mod.readFileFromMemory(testing.allocator, out.written());
+    defer parsed.deinit();
+    try testing.expectEqual(types.CompressionCodec.snappy, parsed.metadata.row_groups[0].columns[0].codec);
+
+    var label_col = try parsed.readColumn(testing.allocator, 0, 1);
+    defer label_col.deinit(testing.allocator);
+    try testing.expectEqualSlices(bool, validity[0..], label_col.byte_array.validity.?);
+    for (labels, label_col.byte_array.values) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "writer creates gzip-compressed pages readable by reader" {
+    const testing = std.testing;
+    const reader_mod = @import("reader.zig");
+    const cols = [_]types.Column{
+        .{ .name = "id", .column_type = .{ .physical = .int64 } },
+        .{ .name = "label", .column_type = .{ .physical = .byte_array, .logical = .string }, .repetition = .optional },
+    };
+    const schema = types.Schema.init("schema", cols[0..]);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var w = StreamWriter.initOptions(testing.allocator, &out.writer, schema, .{ .compression = .gzip });
+    defer w.deinit();
+    try w.start();
+
+    const ids = [_]i64{ 10, 11, 12, 13, 14 };
+    const labels = [_][]const u8{ "prefix-000001-suffix", "prefix-000002-suffix", "prefix-000001-suffix", "prefix-000002-suffix" };
+    const validity = [_]bool{ true, false, true, true, true };
+    const batch = [_]types.ColumnData{
+        .{ .int64 = .{ .values = ids[0..] } },
+        .{ .byte_array = .{ .values = labels[0..], .validity = validity[0..] } },
+    };
+    try w.writeRowGroup(ids.len, batch[0..]);
+    try w.finish();
+
+    var parsed = try reader_mod.readFileFromMemory(testing.allocator, out.written());
+    defer parsed.deinit();
+    try testing.expectEqual(types.CompressionCodec.gzip, parsed.metadata.row_groups[0].columns[0].codec);
+
+    var label_col = try parsed.readColumn(testing.allocator, 0, 1);
+    defer label_col.deinit(testing.allocator);
+    try testing.expectEqualSlices(bool, validity[0..], label_col.byte_array.validity.?);
+    for (labels, label_col.byte_array.values) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+}
+
 test "writer splits large row groups into bounded pages" {
     const testing = std.testing;
     const reader_mod = @import("reader.zig");
@@ -1111,6 +1238,170 @@ test "writer emits data page v2 for plain and dictionary pages" {
     try testing.expectEqualStrings("alpha", label_col.byte_array.values[2]);
     try testing.expectEqualStrings("bravo", label_col.byte_array.values[3]);
     try testing.expectEqualStrings("alpha", label_col.byte_array.values[4]);
+}
+
+test "writer emits delta binary packed integer pages" {
+    const testing = std.testing;
+    const reader_mod = @import("reader.zig");
+    const cols = [_]types.Column{
+        .{ .name = "id", .column_type = .{ .physical = .int64 } },
+        .{ .name = "day", .column_type = .{ .physical = .int32, .logical = .date } },
+    };
+    const schema = types.Schema.init("schema", cols[0..]);
+
+    var ids: [260]i64 = undefined;
+    var days: [260]i32 = undefined;
+    for (&ids, &days, 0..) |*id, *day, i| {
+        id.* = @as(i64, @intCast(i)) * 10 - @as(i64, @intCast(i % 13));
+        day.* = 19_000 + @as(i32, @intCast(i / 2));
+    }
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var w = StreamWriter.initOptions(testing.allocator, &out.writer, schema, .{
+        .compression = .zstd,
+        .use_delta_binary_packed = true,
+    });
+    defer w.deinit();
+    try w.start();
+
+    const batch = [_]types.ColumnData{
+        .{ .int64 = .{ .values = ids[0..] } },
+        .{ .int32 = .{ .values = days[0..] } },
+    };
+    try w.writeRowGroup(ids.len, batch[0..]);
+    try w.finish();
+
+    var parsed = try reader_mod.readFileFromMemory(testing.allocator, out.written());
+    defer parsed.deinit();
+
+    const id_meta = parsed.metadata.row_groups[0].columns[0];
+    try testing.expectEqual(types.Encoding.delta_binary_packed, id_meta.encodings[0]);
+    var id_fixed = std.Io.Reader.fixed(out.written()[@as(usize, @intCast(id_meta.data_page_offset))..]);
+    const id_header = try thrift.readPageHeader(&id_fixed);
+    try testing.expectEqual(types.Encoding.delta_binary_packed, id_header.data_page_header.?.encoding);
+
+    var id_col = try parsed.readColumn(testing.allocator, 0, 0);
+    defer id_col.deinit(testing.allocator);
+    try testing.expectEqualSlices(i64, ids[0..], id_col.int64.values);
+
+    var day_col = try parsed.readColumn(testing.allocator, 0, 1);
+    defer day_col.deinit(testing.allocator);
+    try testing.expectEqualSlices(i32, days[0..], day_col.int32.values);
+}
+
+test "writer emits delta length byte array pages" {
+    const testing = std.testing;
+    const reader_mod = @import("reader.zig");
+    const cols = [_]types.Column{
+        .{ .name = "id", .column_type = .{ .physical = .int64 } },
+        .{ .name = "label", .column_type = .{ .physical = .byte_array, .logical = .string }, .repetition = .optional },
+    };
+    const schema = types.Schema.init("schema", cols[0..]);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var w = StreamWriter.initOptions(testing.allocator, &out.writer, schema, .{
+        .compression = .zstd,
+        .use_delta_length_byte_array = true,
+    });
+    defer w.deinit();
+    try w.start();
+
+    const ids = [_]i64{ 1, 2, 3, 4, 5 };
+    const labels = [_][]const u8{
+        "prefix-000001-suffix",
+        "prefix-000002-suffix",
+        "prefix-000002-tail",
+        "other",
+    };
+    const validity = [_]bool{ true, true, false, true, true };
+    const batch = [_]types.ColumnData{
+        .{ .int64 = .{ .values = ids[0..] } },
+        .{ .byte_array = .{ .values = labels[0..], .validity = validity[0..] } },
+    };
+    try w.writeRowGroup(ids.len, batch[0..]);
+    try w.finish();
+
+    var parsed = try reader_mod.readFileFromMemory(testing.allocator, out.written());
+    defer parsed.deinit();
+
+    const label_meta = parsed.metadata.row_groups[0].columns[1];
+    try testing.expectEqual(types.Encoding.delta_length_byte_array, label_meta.encodings[0]);
+    try testing.expect(label_meta.dictionary_page_offset == null);
+    var label_fixed = std.Io.Reader.fixed(out.written()[@as(usize, @intCast(label_meta.data_page_offset))..]);
+    const label_header = try thrift.readPageHeader(&label_fixed);
+    try testing.expectEqual(types.Encoding.delta_length_byte_array, label_header.data_page_header.?.encoding);
+
+    var label_col = try parsed.readColumn(testing.allocator, 0, 1);
+    defer label_col.deinit(testing.allocator);
+    try testing.expectEqualSlices(bool, validity[0..], label_col.byte_array.validity.?);
+    for (labels, label_col.byte_array.values) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+}
+
+test "writer emits delta byte array pages" {
+    const testing = std.testing;
+    const reader_mod = @import("reader.zig");
+    const cols = [_]types.Column{
+        .{ .name = "id", .column_type = .{ .physical = .int64 } },
+        .{ .name = "label", .column_type = .{ .physical = .byte_array, .logical = .string }, .repetition = .optional },
+        .{ .name = "blob", .column_type = .{ .physical = .fixed_len_byte_array, .type_length = 4 } },
+    };
+    const schema = types.Schema.init("schema", cols[0..]);
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var w = StreamWriter.initOptions(testing.allocator, &out.writer, schema, .{
+        .compression = .zstd,
+        .use_delta_byte_array = true,
+    });
+    defer w.deinit();
+    try w.start();
+
+    const ids = [_]i64{ 1, 2, 3, 4, 5 };
+    const labels = [_][]const u8{
+        "prefix-000001-suffix",
+        "prefix-000002-suffix",
+        "prefix-000002-tail",
+        "other",
+    };
+    const validity = [_]bool{ true, true, false, true, true };
+    const blobs = [_][]const u8{ "abcd", "abce", "abzz", "bbzz", "bbzy" };
+    const batch = [_]types.ColumnData{
+        .{ .int64 = .{ .values = ids[0..] } },
+        .{ .byte_array = .{ .values = labels[0..], .validity = validity[0..] } },
+        .{ .fixed_len_byte_array = .{ .values = blobs[0..] } },
+    };
+    try w.writeRowGroup(ids.len, batch[0..]);
+    try w.finish();
+
+    var parsed = try reader_mod.readFileFromMemory(testing.allocator, out.written());
+    defer parsed.deinit();
+
+    const label_meta = parsed.metadata.row_groups[0].columns[1];
+    try testing.expectEqual(types.Encoding.delta_byte_array, label_meta.encodings[0]);
+    try testing.expect(label_meta.dictionary_page_offset == null);
+    var label_fixed = std.Io.Reader.fixed(out.written()[@as(usize, @intCast(label_meta.data_page_offset))..]);
+    const label_header = try thrift.readPageHeader(&label_fixed);
+    try testing.expectEqual(types.Encoding.delta_byte_array, label_header.data_page_header.?.encoding);
+
+    const blob_meta = parsed.metadata.row_groups[0].columns[2];
+    try testing.expectEqual(types.Encoding.delta_byte_array, blob_meta.encodings[0]);
+
+    var label_col = try parsed.readColumn(testing.allocator, 0, 1);
+    defer label_col.deinit(testing.allocator);
+    try testing.expectEqualSlices(bool, validity[0..], label_col.byte_array.validity.?);
+    for (labels, label_col.byte_array.values) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+
+    var blob_col = try parsed.readColumn(testing.allocator, 0, 2);
+    defer blob_col.deinit(testing.allocator);
+    for (blobs, blob_col.fixed_len_byte_array.values) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
 }
 
 test "writer round-trips fixed-length byte arrays" {

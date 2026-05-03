@@ -88,13 +88,21 @@ def main() -> int:
     pyarrow_delta_byte_array = TMP / "pyarrow_delta_byte_array.parquet"
     pyarrow_dictionary = TMP / "pyarrow_dictionary.parquet"
     pyarrow_default = TMP / "pyarrow_default.parquet"
+    pyarrow_gzip = TMP / "pyarrow_gzip.parquet"
     pyarrow_v2 = TMP / "pyarrow_v2.parquet"
+    pyarrow_v2_gzip = TMP / "pyarrow_v2_gzip.parquet"
     pyarrow_v2_zstd = TMP / "pyarrow_v2_zstd.parquet"
     pyarrow_temporal = TMP / "pyarrow_temporal.parquet"
     zig_zstd = TMP / "zig_zstd.parquet"
+    zig_snappy = TMP / "zig_snappy.parquet"
+    zig_gzip = TMP / "zig_gzip.parquet"
     zig_sequence_uncompressed = TMP / "zig_sequence_uncompressed.parquet"
     zig_sequence_zstd = TMP / "zig_sequence_zstd.parquet"
     zig_sequence_zstd_bss = TMP / "zig_sequence_zstd_bss.parquet"
+    zig_sequence_zstd_delta = TMP / "zig_sequence_zstd_delta.parquet"
+    zig_sequence_zstd_delta_bss = TMP / "zig_sequence_zstd_delta_bss.parquet"
+    zig_sequence_zstd_delta_len = TMP / "zig_sequence_zstd_delta_len.parquet"
+    zig_sequence_zstd_delta_ba = TMP / "zig_sequence_zstd_delta_ba.parquet"
     zig_sequence_v2_zstd = TMP / "zig_sequence_v2_zstd.parquet"
     pyarrow_zstd = TMP / "pyarrow_zstd.parquet"
 
@@ -130,14 +138,54 @@ def main() -> int:
     if zig_zstd_table.to_pylist() != EXPECTED:
         raise AssertionError(f"PyArrow misread Zig zstd output: {zig_zstd_table.to_pylist()!r}")
 
+    run([str(ZIG_WRITER), str(zig_snappy), "snappy"])
+    zig_snappy_table = pq.read_table(zig_snappy)
+    if zig_snappy_table.to_pylist() != EXPECTED:
+        raise AssertionError(f"PyArrow misread Zig snappy output: {zig_snappy_table.to_pylist()!r}")
+
+    run([str(ZIG_WRITER), str(zig_gzip), "gzip"])
+    zig_gzip_table = pq.read_table(zig_gzip)
+    if zig_gzip_table.to_pylist() != EXPECTED:
+        raise AssertionError(f"PyArrow misread Zig gzip output: {zig_gzip_table.to_pylist()!r}")
+
     run([str(ZIG_SEQUENCE_WRITER), str(zig_sequence_uncompressed), "20000", "uncompressed", "20000", "512"])
     run([str(ZIG_SEQUENCE_WRITER), str(zig_sequence_zstd), "20000", "zstd", "20000", "512"])
     run([str(ZIG_SEQUENCE_WRITER), str(zig_sequence_zstd_bss), "20000", "zstd", "20000", "512", "v1", "byte_stream_split"])
+    run([str(ZIG_SEQUENCE_WRITER), str(zig_sequence_zstd_delta), "20000", "zstd", "20000", "512", "v1", "delta_binary_packed"])
+    run([str(ZIG_SEQUENCE_WRITER), str(zig_sequence_zstd_delta_len), "20000", "zstd", "20000", "512", "v1", "delta_length_byte_array"])
+    run([str(ZIG_SEQUENCE_WRITER), str(zig_sequence_zstd_delta_ba), "20000", "zstd", "20000", "512", "v1", "delta_byte_array"])
+    run(
+        [
+            str(ZIG_SEQUENCE_WRITER),
+            str(zig_sequence_zstd_delta_bss),
+            "20000",
+            "zstd",
+            "20000",
+            "512",
+            "v1",
+            "delta_binary_packed+byte_stream_split",
+        ]
+    )
     assert_page_indexes(zig_sequence_uncompressed)
     assert_page_indexes(zig_sequence_zstd)
     assert_page_indexes(zig_sequence_zstd_bss)
+    assert_page_indexes(zig_sequence_zstd_delta)
+    assert_page_indexes(zig_sequence_zstd_delta_bss)
+    assert_page_indexes(zig_sequence_zstd_delta_len)
+    assert_page_indexes(zig_sequence_zstd_delta_ba)
     if "BYTE_STREAM_SPLIT" not in pq.ParquetFile(zig_sequence_zstd_bss).metadata.row_group(0).column(1).encodings:
         raise AssertionError("Zig byte-stream-split sequence did not mark score pages as BYTE_STREAM_SPLIT")
+    if "DELTA_BINARY_PACKED" not in pq.ParquetFile(zig_sequence_zstd_delta).metadata.row_group(0).column(0).encodings:
+        raise AssertionError("Zig delta sequence did not mark id pages as DELTA_BINARY_PACKED")
+    if "DELTA_LENGTH_BYTE_ARRAY" not in pq.ParquetFile(zig_sequence_zstd_delta_len).metadata.row_group(0).column(2).encodings:
+        raise AssertionError("Zig delta-length sequence did not mark name pages as DELTA_LENGTH_BYTE_ARRAY")
+    if "DELTA_BYTE_ARRAY" not in pq.ParquetFile(zig_sequence_zstd_delta_ba).metadata.row_group(0).column(2).encodings:
+        raise AssertionError("Zig delta-byte-array sequence did not mark name pages as DELTA_BYTE_ARRAY")
+    delta_bss_metadata = pq.ParquetFile(zig_sequence_zstd_delta_bss).metadata
+    if "DELTA_BINARY_PACKED" not in delta_bss_metadata.row_group(0).column(0).encodings:
+        raise AssertionError("Zig delta+bss sequence did not mark id pages as DELTA_BINARY_PACKED")
+    if "BYTE_STREAM_SPLIT" not in delta_bss_metadata.row_group(0).column(1).encodings:
+        raise AssertionError("Zig delta+bss sequence did not mark score pages as BYTE_STREAM_SPLIT")
     if zig_sequence_zstd.stat().st_size >= zig_sequence_uncompressed.stat().st_size:
         raise AssertionError(
             f"Zig zstd output did not shrink sequence fixture: {zig_sequence_zstd.stat().st_size} >= {zig_sequence_uncompressed.stat().st_size}"
@@ -146,8 +194,20 @@ def main() -> int:
         raise AssertionError(
             f"Zig byte-stream-split zstd output did not shrink sequence fixture: {zig_sequence_zstd_bss.stat().st_size} >= {zig_sequence_uncompressed.stat().st_size}"
         )
+    if zig_sequence_zstd_delta.stat().st_size >= zig_sequence_uncompressed.stat().st_size:
+        raise AssertionError(
+            f"Zig delta zstd output did not shrink sequence fixture: {zig_sequence_zstd_delta.stat().st_size} >= {zig_sequence_uncompressed.stat().st_size}"
+        )
+    if zig_sequence_zstd_delta_bss.stat().st_size >= zig_sequence_uncompressed.stat().st_size:
+        raise AssertionError(
+            f"Zig delta+bss zstd output did not shrink sequence fixture: {zig_sequence_zstd_delta_bss.stat().st_size} >= {zig_sequence_uncompressed.stat().st_size}"
+        )
     validate_sequence_file(zig_sequence_zstd, 20000)
     validate_sequence_file(zig_sequence_zstd_bss, 20000)
+    validate_sequence_file(zig_sequence_zstd_delta, 20000)
+    validate_sequence_file(zig_sequence_zstd_delta_len, 20000)
+    validate_sequence_file(zig_sequence_zstd_delta_ba, 20000)
+    validate_sequence_file(zig_sequence_zstd_delta_bss, 20000)
 
     run([str(ZIG_SEQUENCE_WRITER), str(zig_sequence_v2_zstd), "20000", "zstd", "20000", "512", "v2"])
     assert_page_indexes(zig_sequence_v2_zstd)
@@ -161,6 +221,10 @@ def main() -> int:
     for codec, page_version, row_group_rows, max_page_rows in (
         ("uncompressed", "v1", 3333, 257),
         ("uncompressed", "v2", 4096, 128),
+        ("snappy", "v1", 4096, 128),
+        ("snappy", "v2", 3333, 257),
+        ("gzip", "v1", 4096, 128),
+        ("gzip", "v2", 3333, 257),
         ("zstd", "v1", 4096, 128),
         ("zstd", "v2", 3333, 257),
     ):
@@ -209,6 +273,16 @@ def main() -> int:
 
     pq.write_table(
         pyarrow_table,
+        pyarrow_gzip,
+        compression="GZIP",
+        use_dictionary=False,
+        data_page_version="1.0",
+        row_group_size=3,
+    )
+    run([str(ZIG_READER), str(pyarrow_gzip)])
+
+    pq.write_table(
+        pyarrow_table,
         pyarrow_v2,
         compression="NONE",
         use_dictionary=False,
@@ -226,6 +300,16 @@ def main() -> int:
         row_group_size=3,
     )
     run([str(ZIG_READER), str(pyarrow_v2_zstd)])
+
+    pq.write_table(
+        pyarrow_table,
+        pyarrow_v2_gzip,
+        compression="GZIP",
+        use_dictionary=False,
+        data_page_version="2.0",
+        row_group_size=3,
+    )
+    run([str(ZIG_READER), str(pyarrow_v2_gzip)])
 
     temporal_rows = 1024
     temporal_table = pa.table(
@@ -380,6 +464,7 @@ def main() -> int:
     run([str(ZIG_SEQUENCE), str(pyarrow_default), str(large_rows)])
 
     pyarrow_large_zstd = TMP / "pyarrow_large_zstd.parquet"
+    pyarrow_large_gzip = TMP / "pyarrow_large_gzip.parquet"
     pq.write_table(
         large_table,
         pyarrow_large_zstd,
@@ -390,6 +475,16 @@ def main() -> int:
         row_group_size=large_rows,
     )
     run([str(ZIG_SEQUENCE), str(pyarrow_large_zstd), str(large_rows)])
+    pq.write_table(
+        large_table,
+        pyarrow_large_gzip,
+        compression="GZIP",
+        use_dictionary=True,
+        data_page_version="1.0",
+        data_page_size=512,
+        row_group_size=large_rows,
+    )
+    run([str(ZIG_SEQUENCE), str(pyarrow_large_gzip), str(large_rows)])
     print("pyarrow-compat-ok")
     return 0
 

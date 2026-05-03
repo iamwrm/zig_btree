@@ -2,6 +2,7 @@ pub const types = @import("types.zig");
 pub const thrift = @import("thrift.zig");
 pub const plain = @import("plain.zig");
 pub const snappy = @import("snappy.zig");
+pub const gzip = @import("gzip.zig");
 pub const zstd = @import("zstd.zig");
 pub const writer = @import("writer.zig");
 pub const reader = @import("reader.zig");
@@ -24,6 +25,7 @@ test {
     _ = thrift;
     _ = plain;
     _ = snappy;
+    _ = gzip;
     _ = zstd;
     _ = writer;
     _ = reader;

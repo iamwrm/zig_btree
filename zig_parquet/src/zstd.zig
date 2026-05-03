@@ -2,6 +2,7 @@ const std = @import("std");
 
 const std_zstd = std.compress.zstd;
 const block_size_max = std_zstd.block_size_max;
+const repeat_scan_window = 128;
 
 const BlockType = enum(u2) {
     raw = 0,
@@ -34,13 +35,64 @@ const RepeatRun = struct {
 };
 
 pub fn decompress(allocator: std.mem.Allocator, compressed: []const u8, output: []u8) !void {
+    decompressZigFrameFast(compressed, output) catch |err| switch (err) {
+        error.UnsupportedFastPath => {},
+        else => return err,
+    };
     decompressDirect(compressed, output) catch {
         try decompressBuffered(allocator, compressed, output);
     };
 }
 
 pub fn decompressWithScratch(compressed: []const u8, output: []u8, scratch: []u8, window_len: usize) !void {
+    decompressZigFrameFast(compressed, output) catch |err| switch (err) {
+        error.UnsupportedFastPath => {},
+        else => return err,
+    };
     try decompressBufferedScratch(compressed, output, scratch, window_len);
+}
+
+fn decompressZigFrameFast(compressed: []const u8, output: []u8) !void {
+    if (compressed.len < 4 + 1 + 8 + 3) return error.UnsupportedFastPath;
+    if (!std.mem.eql(u8, compressed[0..4], "\x28\xb5\x2f\xfd")) return error.UnsupportedFastPath;
+    if (compressed[4] != 0xe0) return error.UnsupportedFastPath;
+
+    const declared_size = std.mem.readInt(u64, compressed[5..13], .little);
+    if (declared_size != output.len) return error.CorruptPage;
+
+    var pos: usize = 13;
+    var out_pos: usize = 0;
+    while (true) {
+        if (pos + 3 > compressed.len) return error.CorruptPage;
+        const header = std.mem.readInt(u24, compressed[pos..][0..3], .little);
+        pos += 3;
+
+        const last = (header & 1) != 0;
+        const block_type = (header >> 1) & 0x3;
+        const size: usize = @intCast(header >> 3);
+        if (size > block_size_max) return error.CorruptPage;
+
+        switch (block_type) {
+            @intFromEnum(BlockType.raw) => {
+                if (pos + size > compressed.len or out_pos + size > output.len) return error.CorruptPage;
+                @memcpy(output[out_pos..][0..size], compressed[pos..][0..size]);
+                pos += size;
+                out_pos += size;
+            },
+            @intFromEnum(BlockType.rle) => {
+                if (pos >= compressed.len or out_pos + size > output.len) return error.CorruptPage;
+                @memset(output[out_pos..][0..size], compressed[pos]);
+                pos += 1;
+                out_pos += size;
+            },
+            @intFromEnum(BlockType.compressed) => return error.UnsupportedFastPath,
+            else => return error.CorruptPage,
+        }
+
+        if (last) break;
+    }
+
+    if (pos != compressed.len or out_pos != output.len) return error.CorruptPage;
 }
 
 fn decompressDirect(compressed: []const u8, output: []u8) !void {
@@ -153,7 +205,7 @@ fn allEqual(bytes: []const u8) bool {
 }
 
 fn findBestRepeatRun(plain: []const u8, pos: usize) ?RepeatRun {
-    const scan_end = @min(plain.len, pos + 1024);
+    const scan_end = @min(plain.len, pos + repeat_scan_window);
     var best: ?RepeatRun = null;
     var best_savings: usize = 0;
 
@@ -409,11 +461,48 @@ test "raw zstd frame round-trips through std decompressor" {
     try testing.expectEqualStrings(input, &output);
 }
 
+test "raw zstd frame round-trips through page fast path" {
+    const testing = std.testing;
+    const input = "zig parquet zstd fast raw frame smoke";
+    const compressed = try compressFrame(testing.allocator, input);
+    defer testing.allocator.free(compressed);
+
+    var output: [input.len]u8 = undefined;
+    var scratch: [input.len + std_zstd.block_size_max]u8 = undefined;
+    try decompressWithScratch(compressed, &output, &scratch, input.len);
+    try testing.expectEqualStrings(input, &output);
+}
+
 test "empty raw zstd frame round-trips" {
     const testing = std.testing;
     const compressed = try compressFrame(testing.allocator, "");
     defer testing.allocator.free(compressed);
     try decompress(testing.allocator, compressed, &.{});
+}
+
+test "rle zstd frame round-trips through page fast path" {
+    const testing = std.testing;
+    var input: [4096]u8 = undefined;
+    @memset(&input, 0xab);
+
+    var frame: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer frame.deinit();
+    try frame.writer.writeAll("\x28\xb5\x2f\xfd");
+    try frame.writer.writeByte(0xe0);
+    try frame.writer.writeInt(u64, input.len, .little);
+    try writeBlockHeader(&frame.writer, .rle, input.len, true);
+    try frame.writer.writeByte(0xab);
+
+    const compressed = try frame.toOwnedSlice();
+    defer testing.allocator.free(compressed);
+
+    const header = std.mem.readInt(u24, compressed[13..][0..3], .little);
+    try testing.expectEqual(@as(u2, @intFromEnum(BlockType.rle)), @as(u2, @intCast((header >> 1) & 0x3)));
+
+    var output: [input.len]u8 = undefined;
+    var scratch: [input.len + std_zstd.block_size_max]u8 = undefined;
+    try decompressWithScratch(compressed, &output, &scratch, input.len);
+    try testing.expectEqualSlices(u8, &input, &output);
 }
 
 test "zstd frame uses compressed repeat blocks when beneficial" {
@@ -432,4 +521,11 @@ test "zstd frame uses compressed repeat blocks when beneficial" {
     defer testing.allocator.free(output);
     try decompress(testing.allocator, compressed, output);
     try testing.expectEqualSlices(u8, input, output);
+
+    const page_output = try testing.allocator.alloc(u8, input.len);
+    defer testing.allocator.free(page_output);
+    const scratch = try testing.allocator.alloc(u8, input.len + std_zstd.block_size_max);
+    defer testing.allocator.free(scratch);
+    try decompressWithScratch(compressed, page_output, scratch, input.len);
+    try testing.expectEqualSlices(u8, input, page_output);
 }

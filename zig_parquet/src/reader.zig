@@ -3,7 +3,9 @@ const types = @import("types.zig");
 const thrift = @import("thrift.zig");
 const plain = @import("plain.zig");
 const snappy = @import("snappy.zig");
+const gzip = @import("gzip.zig");
 const zstd = @import("zstd.zig");
+const native_endian = @import("builtin").target.cpu.arch.endian();
 
 const max_footer_size = 64 * 1024 * 1024;
 const max_page_size = 256 * 1024 * 1024;
@@ -151,11 +153,7 @@ pub const StreamFileReader = struct {
         errdefer acc.deinit(allocator);
         try acc.reserve(allocator, pages.row_count);
 
-        while (try pages.next()) |page| {
-            var page_column = page;
-            defer page_column.deinit(allocator);
-            try acc.append(allocator, page_column);
-        }
+        while (try pages.nextInto(&acc)) {}
 
         return acc.finish(allocator);
     }
@@ -168,8 +166,7 @@ pub const StreamFileReader = struct {
         const dict_header = header.dictionary_page_header orelse return error.CorruptPage;
         if (dict_header.encoding != .plain) return error.UnsupportedEncoding;
         const page_size = try checkedPageSize(header.compressed_page_size);
-        const page_data = try allocator.alloc(u8, page_size);
-        defer allocator.free(page_data);
+        const page_data = try scratch.pageData(allocator, page_size);
         try self.file_reader.interface.readSliceAll(page_data);
         try validatePageCrc(header, page_data);
         const count = std.math.cast(usize, dict_header.num_values) orelse return error.CorruptPage;
@@ -207,7 +204,6 @@ pub const StreamFileReader = struct {
         };
         errdefer iter.deinit();
 
-        iter.dictionary = try self.readDictionary(allocator, iter.column, iter.schema_col, &iter.scratch);
         try self.file_reader.seekTo(try checkedFileOffset(iter.column.data_page_offset));
         return iter;
     }
@@ -413,8 +409,9 @@ pub const ColumnPageIterator = struct {
         const page_rows = try pageRowCount(page_header);
         if (self.rows_seen + page_rows > self.row_count) return error.CorruptPage;
         const page_size = try checkedPageSize(page_header.compressed_page_size);
-        const page_data = try self.allocator.alloc(u8, page_size);
-        defer self.allocator.free(page_data);
+        const data_offset = self.reader.file_reader.logicalPos();
+        const dict = if (pageUsesDictionary(page_header)) try self.ensureDictionary(data_offset) else null;
+        const page_data = try self.scratch.pageData(self.allocator, page_size);
         try self.reader.file_reader.interface.readSliceAll(page_data);
         try validatePageCrc(page_header, page_data);
 
@@ -424,13 +421,75 @@ pub const ColumnPageIterator = struct {
             self.schema_col,
             page_header,
             page_data,
-            if (self.dictionary) |*dict| dict else null,
+            dict,
             &self.scratch,
         );
         self.rows_seen += page_rows;
         return page_column;
     }
+
+    fn nextInto(self: *ColumnPageIterator, acc: *ColumnAccumulator) !bool {
+        if (self.rows_seen >= self.row_count) return false;
+
+        const page_header = try thrift.readPageHeader(&self.reader.file_reader.interface);
+        const page_rows = try pageRowCount(page_header);
+        if (self.rows_seen + page_rows > self.row_count) return error.CorruptPage;
+        const page_size = try checkedPageSize(page_header.compressed_page_size);
+        const data_offset = self.reader.file_reader.logicalPos();
+        const dict = if (pageUsesDictionary(page_header)) try self.ensureDictionary(data_offset) else null;
+        const page_data = try self.scratch.pageData(self.allocator, page_size);
+        try self.reader.file_reader.interface.readSliceAll(page_data);
+        try validatePageCrc(page_header, page_data);
+
+        const appended = try decodeColumnPageIntoAccumulator(
+            self.allocator,
+            self.column,
+            self.schema_col,
+            page_header,
+            page_data,
+            dict,
+            &self.scratch,
+            acc,
+        );
+        if (!appended) {
+            var page_column = try decodeColumnPage(
+                self.allocator,
+                self.column,
+                self.schema_col,
+                page_header,
+                page_data,
+                dict,
+                &self.scratch,
+            );
+            defer page_column.deinit(self.allocator);
+            try acc.append(self.allocator, page_column);
+        }
+        self.rows_seen += page_rows;
+        return true;
+    }
+
+    fn ensureDictionary(self: *ColumnPageIterator, resume_offset: u64) !*const types.OwnedColumn {
+        if (self.dictionary == null) {
+            self.dictionary = (try self.reader.readDictionary(self.allocator, self.column, self.schema_col, &self.scratch)) orelse return error.CorruptPage;
+            try self.reader.file_reader.seekTo(resume_offset);
+        }
+        return if (self.dictionary) |*dict| dict else unreachable;
+    }
 };
+
+fn pageUsesDictionary(page_header: types.PageHeader) bool {
+    return switch (page_header.page_type) {
+        .data_page => blk: {
+            const data_header = page_header.data_page_header orelse break :blk false;
+            break :blk data_header.encoding == .rle_dictionary or data_header.encoding == .plain_dictionary;
+        },
+        .data_page_v2 => blk: {
+            const data_header = page_header.data_page_header_v2 orelse break :blk false;
+            break :blk data_header.encoding == .rle_dictionary or data_header.encoding == .plain_dictionary;
+        },
+        else => false,
+    };
+}
 
 pub fn readFileFromMemory(allocator: std.mem.Allocator, bytes: []const u8) !ParsedFile {
     if (bytes.len < 12) return error.InvalidParquetFile;
@@ -515,6 +574,71 @@ fn decodeColumnPage(
     const indexes = try plain.decodeRleBitPackedUint32(allocator, data[1..], bit_width, non_null_count);
     defer allocator.free(indexes);
     return plain.materializeDictionary(allocator, column.physical_type, dict, indexes, validity);
+}
+
+fn decodeColumnPageIntoAccumulator(
+    allocator: std.mem.Allocator,
+    column: types.ColumnChunkMeta,
+    schema_col: types.Column,
+    page_header: types.PageHeader,
+    page_data: []const u8,
+    dictionary: ?*const types.OwnedColumn,
+    scratch: *PageDecodeScratch,
+    acc: *ColumnAccumulator,
+) !bool {
+    if (page_header.page_type != .data_page) return false;
+
+    const data_header = page_header.data_page_header orelse return error.CorruptPage;
+    const dictionary_encoded = data_header.encoding == .rle_dictionary or data_header.encoding == .plain_dictionary;
+    const plain_fixed = data_header.encoding == .plain and fixedAccumulatorSupported(schema_col.column_type.physical);
+    const dictionary_supported = dictionary_encoded and dictionaryAccumulatorSupported(schema_col.column_type.physical);
+    if (!plain_fixed and !dictionary_supported) return false;
+
+    const row_count = std.math.cast(usize, data_header.num_values) orelse return error.CorruptPage;
+    const page_bytes = try preparePageBytes(allocator, column.codec, page_header, page_data, scratch);
+    defer page_bytes.deinit(allocator);
+
+    var data = page_bytes.data;
+    var validity: ?[]bool = null;
+    defer if (validity) |v| allocator.free(v);
+    var non_null_count = row_count;
+    if (schema_col.repetition == .optional) {
+        const decoded = try plain.decodeDefinitionLevels(allocator, data, row_count);
+        validity = decoded.levels;
+        data = data[decoded.consumed..];
+        non_null_count = 0;
+        for (validity.?) |valid| {
+            if (valid) non_null_count += 1;
+        }
+    }
+
+    switch (data_header.encoding) {
+        .plain => return try acc.appendPlainFixedValues(allocator, schema_col.column_type, non_null_count, data, validity),
+        .rle_dictionary, .plain_dictionary => {
+            const dict = dictionary orelse return error.CorruptPage;
+            if (data.len == 0) return error.CorruptPage;
+            const bit_width = data[0];
+            if (try acc.appendDictionaryEncodedValues(allocator, column.physical_type, dict, data[1..], bit_width, non_null_count, validity)) return true;
+            const indexes = try plain.decodeRleBitPackedUint32(allocator, data[1..], bit_width, non_null_count);
+            defer allocator.free(indexes);
+            return try acc.appendDictionaryValues(allocator, column.physical_type, dict, indexes, validity);
+        },
+        else => return false,
+    }
+}
+
+fn fixedAccumulatorSupported(physical_type: types.Type) bool {
+    return switch (physical_type) {
+        .int32, .int64, .float, .double => true,
+        else => false,
+    };
+}
+
+fn dictionaryAccumulatorSupported(physical_type: types.Type) bool {
+    return switch (physical_type) {
+        .int32, .int64, .float, .double, .byte_array, .fixed_len_byte_array => true,
+        else => false,
+    };
 }
 
 fn decodeColumnPageV2(
@@ -848,6 +972,270 @@ const ColumnAccumulator = union(enum) {
         }
     }
 
+    fn appendPlainFixedValues(self: *ColumnAccumulator, allocator: std.mem.Allocator, column_type: types.ColumnType, count: usize, data: []const u8, validity: ?[]const bool) !bool {
+        return switch (column_type.physical) {
+            .int32 => switch (self.*) {
+                .int32 => |*acc| blk: {
+                    try appendPlainIntValues(i32, allocator, &acc.values, count, data);
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .int64 => switch (self.*) {
+                .int64 => |*acc| blk: {
+                    try appendPlainIntValues(i64, allocator, &acc.values, count, data);
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .float => switch (self.*) {
+                .float => |*acc| blk: {
+                    try appendPlainFloatValues(f32, u32, allocator, &acc.values, count, data);
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .double => switch (self.*) {
+                .double => |*acc| blk: {
+                    try appendPlainFloatValues(f64, u64, allocator, &acc.values, count, data);
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    fn appendDictionaryValues(self: *ColumnAccumulator, allocator: std.mem.Allocator, physical_type: types.Type, dictionary: *const types.OwnedColumn, indexes: []const u32, validity: ?[]const bool) !bool {
+        return switch (physical_type) {
+            .int32 => switch (self.*) {
+                .int32 => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .int32 => |dict| try appendDictionaryFixed(i32, allocator, &acc.values, dict.values, indexes),
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .int64 => switch (self.*) {
+                .int64 => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .int64 => |dict| try appendDictionaryFixed(i64, allocator, &acc.values, dict.values, indexes),
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .float => switch (self.*) {
+                .float => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .float => |dict| try appendDictionaryFixed(f32, allocator, &acc.values, dict.values, indexes),
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .double => switch (self.*) {
+                .double => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .double => |dict| try appendDictionaryFixed(f64, allocator, &acc.values, dict.values, indexes),
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .byte_array => switch (self.*) {
+                .byte_array => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .byte_array => |dict| try appendDictionaryByteRanges(allocator, acc, dict.values, indexes),
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .fixed_len_byte_array => switch (self.*) {
+                .fixed_len_byte_array => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .fixed_len_byte_array => |dict| try appendDictionaryByteRanges(allocator, acc, dict.values, indexes),
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    fn appendDictionaryEncodedValues(self: *ColumnAccumulator, allocator: std.mem.Allocator, physical_type: types.Type, dictionary: *const types.OwnedColumn, data: []const u8, bit_width: u8, count: usize, validity: ?[]const bool) !bool {
+        return switch (physical_type) {
+            .int32 => switch (self.*) {
+                .int32 => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .int32 => |dict| {
+                            if (!try appendDictionaryIdentitySlice(i32, allocator, &acc.values, dict.values, data, bit_width, count)) {
+                                try appendDictionaryFixedEncoded(i32, allocator, &acc.values, dict.values, data, bit_width, count);
+                            }
+                        },
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .int64 => switch (self.*) {
+                .int64 => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .int64 => |dict| {
+                            if (!try appendDictionaryIdentitySlice(i64, allocator, &acc.values, dict.values, data, bit_width, count)) {
+                                try appendDictionaryFixedEncoded(i64, allocator, &acc.values, dict.values, data, bit_width, count);
+                            }
+                        },
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .float => switch (self.*) {
+                .float => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .float => |dict| {
+                            if (!try appendDictionaryIdentitySlice(f32, allocator, &acc.values, dict.values, data, bit_width, count)) {
+                                try appendDictionaryFixedEncoded(f32, allocator, &acc.values, dict.values, data, bit_width, count);
+                            }
+                        },
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .double => switch (self.*) {
+                .double => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .double => |dict| {
+                            if (!try appendDictionaryIdentitySlice(f64, allocator, &acc.values, dict.values, data, bit_width, count)) {
+                                try appendDictionaryFixedEncoded(f64, allocator, &acc.values, dict.values, data, bit_width, count);
+                            }
+                        },
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    fn dictionaryIdentityStart(self: *ColumnAccumulator, physical_type: types.Type) ?usize {
+        return switch (physical_type) {
+            .int32 => switch (self.*) {
+                .int32 => |*acc| acc.values.items.len,
+                else => null,
+            },
+            .int64 => switch (self.*) {
+                .int64 => |*acc| acc.values.items.len,
+                else => null,
+            },
+            .float => switch (self.*) {
+                .float => |*acc| acc.values.items.len,
+                else => null,
+            },
+            .double => switch (self.*) {
+                .double => |*acc| acc.values.items.len,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    fn appendDictionaryIdentityValues(self: *ColumnAccumulator, allocator: std.mem.Allocator, physical_type: types.Type, dictionary: *const types.OwnedColumn, start: usize, count: usize, validity: ?[]const bool) !bool {
+        return switch (physical_type) {
+            .int32 => switch (self.*) {
+                .int32 => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .int32 => |dict| {
+                            const end = std.math.add(usize, start, count) catch return error.CorruptPage;
+                            if (end > dict.values.len) return error.CorruptPage;
+                            try acc.values.appendSlice(allocator, dict.values[start..end]);
+                        },
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .int64 => switch (self.*) {
+                .int64 => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .int64 => |dict| {
+                            const end = std.math.add(usize, start, count) catch return error.CorruptPage;
+                            if (end > dict.values.len) return error.CorruptPage;
+                            try acc.values.appendSlice(allocator, dict.values[start..end]);
+                        },
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .float => switch (self.*) {
+                .float => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .float => |dict| {
+                            const end = std.math.add(usize, start, count) catch return error.CorruptPage;
+                            if (end > dict.values.len) return error.CorruptPage;
+                            try acc.values.appendSlice(allocator, dict.values[start..end]);
+                        },
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            .double => switch (self.*) {
+                .double => |*acc| blk: {
+                    switch (dictionary.*) {
+                        .double => |dict| {
+                            const end = std.math.add(usize, start, count) catch return error.CorruptPage;
+                            if (end > dict.values.len) return error.CorruptPage;
+                            try acc.values.appendSlice(allocator, dict.values[start..end]);
+                        },
+                        else => return error.CorruptPage,
+                    }
+                    try appendValidity(allocator, &acc.validity, acc.optional, validity);
+                    break :blk true;
+                },
+                else => false,
+            },
+            else => false,
+        };
+    }
+
     fn finish(self: *ColumnAccumulator, allocator: std.mem.Allocator) !types.OwnedColumn {
         return switch (self.*) {
             .boolean => |*acc| .{ .boolean = .{
@@ -906,7 +1294,187 @@ const ColumnAccumulator = union(enum) {
     }
 };
 
-fn appendValidity(allocator: std.mem.Allocator, dest: *std.ArrayList(bool), optional: bool, validity: ?[]bool) !void {
+fn appendPlainIntValues(comptime T: type, allocator: std.mem.Allocator, values: *std.ArrayList(T), count: usize, data: []const u8) !void {
+    const bytes = std.math.mul(usize, @sizeOf(T), count) catch return error.CorruptPage;
+    if (data.len < bytes) return error.CorruptPage;
+    const dest = try values.addManyAsSlice(allocator, count);
+    if (native_endian == .little) {
+        @memcpy(std.mem.sliceAsBytes(dest), data[0..bytes]);
+    } else {
+        for (dest, 0..) |*value, i| value.* = std.mem.readInt(T, data[i * @sizeOf(T) ..][0..@sizeOf(T)], .little);
+    }
+}
+
+fn appendPlainFloatValues(comptime T: type, comptime U: type, allocator: std.mem.Allocator, values: *std.ArrayList(T), count: usize, data: []const u8) !void {
+    const bytes = std.math.mul(usize, @sizeOf(T), count) catch return error.CorruptPage;
+    if (data.len < bytes) return error.CorruptPage;
+    const dest = try values.addManyAsSlice(allocator, count);
+    if (native_endian == .little) {
+        @memcpy(std.mem.sliceAsBytes(dest), data[0..bytes]);
+    } else {
+        for (dest, 0..) |*value, i| value.* = @bitCast(std.mem.readInt(U, data[i * @sizeOf(T) ..][0..@sizeOf(T)], .little));
+    }
+}
+
+fn appendDictionaryFixed(comptime T: type, allocator: std.mem.Allocator, values: *std.ArrayList(T), dictionary: []const T, indexes: []const u32) !void {
+    const dest = try values.addManyAsSlice(allocator, indexes.len);
+    for (indexes, dest) |idx, *value| {
+        if (idx >= dictionary.len) return error.CorruptPage;
+        value.* = dictionary[idx];
+    }
+}
+
+fn appendDictionaryIdentitySlice(comptime T: type, allocator: std.mem.Allocator, values: *std.ArrayList(T), dictionary: []const T, data: []const u8, bit_width: u8, count: usize) !bool {
+    const start = values.items.len;
+    if (!try plain.rleBitPackedUint32IdentityFrom(data, bit_width, count, start)) return false;
+    const end = std.math.add(usize, start, count) catch return error.CorruptPage;
+    if (end > dictionary.len) return error.CorruptPage;
+    try values.appendSlice(allocator, dictionary[start..end]);
+    return true;
+}
+
+fn appendDictionaryFixedEncoded(comptime T: type, allocator: std.mem.Allocator, values: *std.ArrayList(T), dictionary: []const T, data: []const u8, bit_width: u8, count: usize) !void {
+    if (bit_width > 32) return error.CorruptPage;
+    const dest = try values.addManyAsSlice(allocator, count);
+    if (bit_width == 0) {
+        if (dictionary.len == 0) return error.CorruptPage;
+        fillDictionaryRun(T, dest, dictionary[0]);
+        return;
+    }
+
+    const width_bytes = (@as(usize, bit_width) + 7) / 8;
+    var pos: usize = 0;
+    var idx: usize = 0;
+    while (pos < data.len and idx < count) {
+        const header = try readRleVarUint(data, &pos);
+        if ((header & 1) == 0) {
+            const run_len = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
+            if (width_bytes > data.len - pos) return error.CorruptPage;
+            const dict_idx = try readRleIndexValue(data[pos..][0..width_bytes]);
+            pos += width_bytes;
+            if (dict_idx >= dictionary.len or run_len > count - idx) return error.CorruptPage;
+            fillDictionaryRun(T, dest[idx..][0..run_len], dictionary[dict_idx]);
+            idx += run_len;
+        } else {
+            const group_count = std.math.cast(usize, header >> 1) orelse return error.CorruptPage;
+            const total = std.math.mul(usize, group_count, 8) catch return error.CorruptPage;
+            const bit_len = std.math.mul(usize, total, @as(usize, bit_width)) catch return error.CorruptPage;
+            const byte_len = try ceilDiv8Local(bit_len);
+            if (byte_len > data.len - pos) return error.CorruptPage;
+
+            const decode_count = @min(total, count - idx);
+            try appendDictionaryBitPackedRun(T, dest[idx..][0..decode_count], dictionary, data[pos..][0..byte_len], bit_width);
+            idx += decode_count;
+            pos += byte_len;
+        }
+    }
+    if (idx != count) return error.CorruptPage;
+}
+
+fn fillDictionaryRun(comptime T: type, dest: []T, value: T) void {
+    for (dest) |*slot| slot.* = value;
+}
+
+fn appendDictionaryBitPackedRun(comptime T: type, dest: []T, dictionary: []const T, data: []const u8, bit_width: u8) !void {
+    switch (bit_width) {
+        8 => {
+            for (dest, data[0..dest.len]) |*value, idx| {
+                if (idx >= dictionary.len) return error.CorruptPage;
+                value.* = dictionary[idx];
+            }
+        },
+        16 => {
+            for (dest, 0..) |*value, i| {
+                const offset = i * 2;
+                const idx = @as(u32, data[offset]) |
+                    (@as(u32, data[offset + 1]) << 8);
+                if (idx >= dictionary.len) return error.CorruptPage;
+                value.* = dictionary[idx];
+            }
+        },
+        24 => {
+            for (dest, 0..) |*value, i| {
+                const offset = i * 3;
+                const idx = @as(u32, data[offset]) |
+                    (@as(u32, data[offset + 1]) << 8) |
+                    (@as(u32, data[offset + 2]) << 16);
+                if (idx >= dictionary.len) return error.CorruptPage;
+                value.* = dictionary[idx];
+            }
+        },
+        32 => {
+            for (dest, 0..) |*value, i| {
+                const idx = std.mem.readInt(u32, data[i * 4 ..][0..4], .little);
+                if (idx >= dictionary.len) return error.CorruptPage;
+                value.* = dictionary[idx];
+            }
+        },
+        else => {
+            var bit_pos: usize = 0;
+            for (dest) |*value| {
+                const idx = readPackedIndex(data, bit_pos, bit_width);
+                if (idx >= dictionary.len) return error.CorruptPage;
+                value.* = dictionary[idx];
+                bit_pos += bit_width;
+            }
+        },
+    }
+}
+
+fn readRleVarUint(data: []const u8, pos: *usize) !u64 {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+    while (true) {
+        if (pos.* >= data.len) return error.CorruptPage;
+        const byte = data[pos.*];
+        pos.* += 1;
+        result |= (@as(u64, byte & 0x7f) << shift);
+        if ((byte & 0x80) == 0) return result;
+        if (shift >= 63) return error.CorruptPage;
+        shift += 7;
+    }
+}
+
+fn readRleIndexValue(data: []const u8) !usize {
+    var value: u32 = 0;
+    for (data, 0..) |byte, i| value |= @as(u32, byte) << @intCast(i * 8);
+    return std.math.cast(usize, value) orelse error.CorruptPage;
+}
+
+fn readPackedIndex(data: []const u8, start_bit: usize, bit_width: u8) u32 {
+    var value: u32 = 0;
+    var bit: u8 = 0;
+    while (bit < bit_width) : (bit += 1) {
+        const absolute = start_bit + bit;
+        const source = (data[absolute / 8] >> @intCast(absolute & 7)) & 1;
+        value |= @as(u32, source) << @intCast(bit);
+    }
+    return value;
+}
+
+fn ceilDiv8Local(value: usize) !usize {
+    const adjusted = std.math.add(usize, value, 7) catch return error.CorruptPage;
+    return adjusted / 8;
+}
+
+fn appendDictionaryByteRanges(allocator: std.mem.Allocator, acc: anytype, dictionary: []const []const u8, indexes: []const u32) !void {
+    var total_bytes: usize = 0;
+    for (indexes) |idx| {
+        if (idx >= dictionary.len) return error.CorruptPage;
+        total_bytes = std.math.add(usize, total_bytes, dictionary[idx].len) catch return error.CorruptPage;
+    }
+
+    const ranges = try acc.values.addManyAsSlice(allocator, indexes.len);
+    try acc.bytes.ensureUnusedCapacity(allocator, total_bytes);
+    for (indexes, ranges) |idx, *range| {
+        const value = dictionary[idx];
+        const start = acc.bytes.items.len;
+        acc.bytes.appendSliceAssumeCapacity(value);
+        range.* = .{ .start = start, .len = value.len };
+    }
+}
+
+fn appendValidity(allocator: std.mem.Allocator, dest: *std.ArrayList(bool), optional: bool, validity: ?[]const bool) !void {
     if (!optional) return;
     try dest.appendSlice(allocator, validity orelse return error.CorruptPage);
 }
@@ -947,7 +1515,7 @@ fn validateSupported(metadata: types.FileMetaData, file_size: u64) !void {
             try validateIndexReference(file_size, column.offset_index_offset, column.offset_index_length);
             try validateIndexReference(file_size, column.column_index_offset, column.column_index_length);
             switch (column.codec) {
-                .uncompressed, .snappy, .zstd => {},
+                .uncompressed, .snappy, .gzip, .zstd => {},
                 else => return error.UnsupportedCompression,
             }
             var has_supported_value_encoding = false;
@@ -984,10 +1552,17 @@ const PageBytes = struct {
 };
 
 const PageDecodeScratch = struct {
+    page_buffer: std.ArrayList(u8) = .empty,
     zstd_buffer: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *PageDecodeScratch, allocator: std.mem.Allocator) void {
+        self.page_buffer.deinit(allocator);
         self.zstd_buffer.deinit(allocator);
+    }
+
+    fn pageData(self: *PageDecodeScratch, allocator: std.mem.Allocator, len: usize) ![]u8 {
+        try self.page_buffer.ensureTotalCapacity(allocator, len);
+        return self.page_buffer.allocatedSlice()[0..len];
     }
 
     fn zstdScratch(self: *PageDecodeScratch, allocator: std.mem.Allocator, uncompressed_size: usize) ![]u8 {
@@ -1034,6 +1609,12 @@ fn prepareValueBytes(
             const out = try allocator.alloc(u8, uncompressed_size);
             errdefer allocator.free(out);
             try snappy.decompress(compressed, out);
+            return .{ .data = out, .owned = out };
+        },
+        .gzip => {
+            const out = try allocator.alloc(u8, uncompressed_size);
+            errdefer allocator.free(out);
+            try gzip.decompress(compressed, out);
             return .{ .data = out, .owned = out };
         },
         .zstd => {

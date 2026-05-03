@@ -121,6 +121,28 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(parquet_write_sequence);
 
+    const parquet_write_matrix = b.addExecutable(.{
+        .name = "parquet_write_matrix",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig_parquet/test/write_matrix.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "parquet", .module = parquet_mod }},
+        }),
+    });
+    b.installArtifact(parquet_write_matrix);
+
+    const parquet_bench_read = b.addExecutable(.{
+        .name = "parquet_bench_read",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig_parquet/test/bench_read.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "parquet", .module = parquet_mod }},
+        }),
+    });
+    b.installArtifact(parquet_bench_read);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_phmap_unit_tests.step);
     test_step.dependOn(&run_phmap_stress_tests.step);

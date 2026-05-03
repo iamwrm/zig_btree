@@ -14,8 +14,12 @@ Pure Zig Parquet reader/writer for flat, primitive schemas.
 - `RLE`-encoded `BOOLEAN` data pages produced by common writers.
 - `BYTE_STREAM_SPLIT` data pages for fixed-width values when reading, and for
   float/double columns when writing (`writer.Options.use_byte_stream_split`).
-- `DELTA_BINARY_PACKED` integer pages when reading.
-- `DELTA_LENGTH_BYTE_ARRAY` and `DELTA_BYTE_ARRAY` pages when reading.
+- `DELTA_BINARY_PACKED` integer pages when reading and writing
+  (`writer.Options.use_delta_binary_packed`).
+- `DELTA_LENGTH_BYTE_ARRAY` byte-array pages when reading and writing
+  (`writer.Options.use_delta_length_byte_array`).
+- `DELTA_BYTE_ARRAY` byte-array and fixed-length byte-array pages when reading
+  and writing (`writer.Options.use_delta_byte_array`).
 - Dictionary pages and `RLE_DICTIONARY` / `PLAIN_DICTIONARY` data pages for reading.
 - Writer-side `BYTE_ARRAY` dictionary pages when repeated values make them useful
   (`writer.Options.use_dictionary`, enabled by default).
@@ -29,7 +33,7 @@ Pure Zig Parquet reader/writer for flat, primitive schemas.
 - Writer-side `OffsetIndex` and `ColumnIndex` footer sections for pages with
   supported statistics, plus streaming reader parsing of those page indexes for
   page row ranges, offsets, sizes, and page-level statistics.
-- Snappy-compressed pages for reading.
+- Snappy- and Gzip-compressed pages for reading and writing.
 - Zstandard-compressed pages for reading and writing. The writer uses a bounded
   pure-Zig zstd encoder with RLE blocks and raw-literal/repeated-sequence
   compressed blocks, with raw-block fallback when compression is not beneficial.
@@ -37,7 +41,7 @@ Pure Zig Parquet reader/writer for flat, primitive schemas.
   (`writer.Options.max_page_rows`, default 64K rows) plus footer metadata.
 - File-backed reader that loads the footer and one requested column page at a time.
 
-Unsupported codecs other than Snappy/Zstandard, nested/repeated schema, and legacy INT96 currently return explicit errors instead of being decoded incorrectly.
+Unsupported codecs other than Snappy/Gzip/Zstandard, nested/repeated schema, and legacy INT96 currently return explicit errors instead of being decoded incorrectly.
 
 ## Production Readiness
 
@@ -46,6 +50,45 @@ matrix below, but it is not a general production Parquet implementation yet.
 The biggest remaining gaps are nested/repeated schemas, the wider Parquet
 encoding and codec surface, deeper fuzz/corpus coverage, and a full entropy
 Zstandard writer comparable to mature native implementations.
+
+## Performance Snapshot
+
+Local `ReleaseFast` run with the pinned toolchain, `250000` rows, and
+`--read-iterations 10`. Rates are logical Parquet uncompressed MiB/s; write
+rates are end-to-end fixture generation plus file write rates. PyArrow read
+rates use the benchmark's default single-thread mode; pass `--pyarrow-use-threads`
+to compare against PyArrow's threaded reader.
+
+| Case | Writer | Write | Zig read | PyArrow read | Zig/PyArrow read |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Zig uncompressed | Zig | 262 | 1701 | 862 | 1.97x |
+| Zig Snappy | Zig | 208 | 921 | 677 | 1.36x |
+| Zig Gzip | Zig | 111 | 183 | 480 | 0.38x |
+| Zig Zstd plain | Zig | 288 | 574 | 788 | 0.73x |
+| Zig Zstd delta-binary | Zig | 202 | 554 | 530 | 1.05x |
+| PyArrow uncompressed input | PyArrow | 56 | 1057 | 1185 | 0.89x |
+| PyArrow Snappy input | PyArrow | 55 | 729 | 711 | 1.03x |
+| PyArrow Gzip input | PyArrow | 2 | 141 | 423 | 0.33x |
+| PyArrow Zstd input | PyArrow | 54 | 39 | 764 | 0.05x |
+
+Write comparison from the same run:
+
+| Codec | Zig write | PyArrow write | Zig/PyArrow write |
+| --- | ---: | ---: | ---: |
+| Uncompressed | 262 | 56 | 4.68x |
+| Snappy | 208 | 55 | 3.78x |
+| Gzip | 111 | 2 | 55.5x |
+| Zstd plain | 288 | 54 | 5.33x |
+
+The Zstd delta-binary row above is a separate Zig-only encoding path, so it is
+not included in the direct writer comparison.
+
+These numbers show the current flat-schema fast paths are competitive for
+uncompressed, Snappy, and delta-binary Zstd Zig-written files. Lazy dictionary
+loading plus byte-aligned and identity dictionary-index fast paths put
+PyArrow-written uncompressed and Snappy full-column reads above the 0.70x
+single-thread target. Gzip, general PyArrow Zstd inputs, and the threaded
+PyArrow full-read baseline still need substantial decoder or parallel read work.
 
 ## Streaming Pattern
 
@@ -69,12 +112,23 @@ From the repo root, build fixtures and run PyArrow compatibility:
 ```sh
 .toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast
 uv run --with pyarrow python zig_parquet/tools/verify_pyarrow.py
+uv run --with pyarrow python zig_parquet/tools/verify_writer_matrix.py
 uv run --with pyarrow python zig_parquet/tools/fuzz_digest.py
 uv run python zig_parquet/tools/corrupt_smoke.py
 ```
+
+`fuzz_digest.py` runs 96 deterministic edge-heavy PyArrow writer cases by
+default; pass `--cases N` for a longer corpus sweep.
 
 Run the local throughput harness:
 
 ```sh
 uv run --with pyarrow python zig_parquet/tools/bench_parquet.py --rows 250000
 ```
+
+The benchmark builds Zig-written and PyArrow-written fixtures, times repeated
+in-process Zig and PyArrow reads, and prints per-case throughput ratios. Use
+`--read-iterations N` to amortize timing noise. PyArrow reads are single-threaded
+by default for decode-path comparisons; pass `--pyarrow-use-threads` for the
+threaded baseline. `--min-read-ratio 0.70` gates every printed comparison, so it
+will still fail known Gzip/Zstd gaps until those paths are closed.

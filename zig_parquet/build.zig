@@ -97,6 +97,28 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(write_sequence);
 
+    const write_matrix = b.addExecutable(.{
+        .name = "parquet_write_matrix",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/write_matrix.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "parquet", .module = mod }},
+        }),
+    });
+    b.installArtifact(write_matrix);
+
+    const bench_read = b.addExecutable(.{
+        .name = "parquet_bench_read",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/bench_read.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "parquet", .module = mod }},
+        }),
+    });
+    b.installArtifact(bench_read);
+
     const test_step = b.step("test", "Run parquet tests");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_smoke.step);
