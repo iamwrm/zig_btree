@@ -1,12 +1,12 @@
-# Goal 0005: Improve Zig B-tree Iteration on aarch64
+# Goal 0005: Explain and Improve Zig B-tree Iteration on aarch64
 
-Optimize Zig `zig_btree` ordered iteration until it is within 20% of the C++ Abseil `absl::btree_map` benchmark on the local aarch64 development host.
+Find the concrete implementation reasons Zig `zig_btree` ordered iteration is still slower than C++ Abseil `absl::btree_map`, then optimize Zig until iteration is within 20% of Abseil on the local aarch64 development host or document the architecture change required to get there.
 
 ## Background
 
 The earlier B-tree performance pass improved the Zig implementation but still left substantial local gaps versus Abseil, especially ordered iteration and remove. The current repository also has a root `bench` step for `zig_phmap`, so B-tree performance work must run benchmarks from the `zig_btree/` package directly.
 
-The current compact-leaf-storage pass materially improved all B-tree workloads, but iteration still misses the parity target:
+The compact-leaf-storage pass materially improved all B-tree workloads, but iteration still missed the parity target:
 
 - Local aarch64 Zig median after compact leaf storage:
   - insert: 136.686 ns/op
@@ -24,13 +24,35 @@ The current compact-leaf-storage pass materially improved all B-tree workloads, 
 
 These numbers are still noisy. The first step in this goal is to establish a fresh repeated local aarch64 median baseline from the current code before changing iteration internals.
 
+A later portable insertion-rebalancing pass improved occupancy and iteration but still did not close the gap:
+
+- Local aarch64 Zig median after insertion rebalancing:
+  - insert: 136.101 ns/op
+  - lookup: 145.680 ns/op
+  - iterate: 5.916 ns/item
+  - remove: 167.492 ns/op
+- Local aarch64 Abseil median from the same audit:
+  - insert: 124.053 ns/op
+  - lookup: 150.311 ns/op
+  - iterate: 3.992 ns/item
+  - remove: 131.939 ns/op
+- Current iteration gap:
+  - Zig is 48.2% slower than Abseil.
+  - The 20% target requires Zig `iterate` <= 4.790 ns/item against that Abseil median.
+
+The next pass must not assume the remaining gap is from generic "iterator overhead." It must look closely at Abseil's C++ implementation and attribute the gap to specific design or code-generation differences before making larger Zig changes.
+
 ## Objective
 
-Improve `zig_btree` ordered iteration so its local aarch64 median performance is competitive with C++ Abseil `absl::btree_map` on the same workload.
+Identify the concrete reasons for the remaining local aarch64 iteration performance gap versus C++ Abseil, then improve `zig_btree` ordered iteration based on that evidence.
 
 Primary target:
 
 - `iterate`: Zig must be no slower than 20% over C++ Abseil median, or faster, on repeated local aarch64 samples.
+
+Primary diagnostic deliverable:
+
+- A checkpointed Abseil-versus-Zig gap attribution that ties the measured iteration gap to specific implementation differences, source locations, and local evidence. Vague explanations such as "C++ is more optimized" or "iterator overhead" are not sufficient.
 
 Secondary targets:
 
@@ -52,7 +74,7 @@ Use multiple local samples and compare medians. Do not claim progress from a sin
 
 ## Required Investigation
 
-Before changing code, inspect the current Zig B-tree implementation and the Abseil comparison point.
+Before changing Zig code, inspect the current Zig B-tree implementation and the Abseil comparison point deeply enough to explain the remaining measured gap.
 
 Inspect Zig:
 
@@ -63,19 +85,23 @@ Inspect Zig:
 Focus on:
 
 - node layout and `deriveMaxSlots`
+- final benchmark node height, leaf count, internal-node count, fullness, and bytes used
 - leaf versus internal node storage
 - child pointer storage in leaf nodes
 - in-node search policy and thresholds
 - insertion split path
+- insertion sibling-rebalancing path and final tree occupancy
 - lookup path and comparator calls
 - iterator/cursor advancement
 - remove path, merge, borrow, and root shrink
 - parent pointer and child-position maintenance
 - allocation behavior and node initialization
 - invariant validation cost in ReleaseFast
+- generated ReleaseFast code shape for `Iterator.next()`, `Cursor.advance()`, `childAt()`, and the benchmark iteration loop
 - whether a leaf-local forward iterator can avoid the generic cursor path
 - whether leftmost/rightmost or leaf successor links can make forward iteration leaf-linear
 - whether internal separator entries force unavoidable parent traversal under the current value-in-all-nodes design
+- how many iterator steps are leaf-local, leaf-to-parent, internal-to-leaf, and end transitions on the benchmark tree
 
 Inspect C++:
 
@@ -94,6 +120,30 @@ Focus on:
 - leftmost/rightmost tracking
 - erase/rebalance strategy
 - allocation count and cache locality
+- exact `btree_node` metadata fields and field widths
+- `LeafSize()`, `InternalSize()`, `NodeTargetSlots()`, and actual slot count for `uint64_t -> uint64_t`
+- whether Abseil generations are enabled in the local build and what iterator validation code remains
+- `btree_iterator::increment()`, `increment_slow()`, dereference path, and range-for codegen
+- root parent-as-leftmost and `rightmost_` end representation
+- `rebalance_or_split()` insertion behavior and how it affects final occupancy
+- whether Abseil avoids optional/null child loads, tagged unions, or extra branches in the iterator hot path
+- whether Abseil's lower node count, node size, metadata packing, inlining, or generated machine code explains the measured per-item difference
+
+Required Abseil evidence:
+
+- Record the relevant Abseil source line ranges in `checkpoints.md`.
+- Record Abseil's computed node slot count and leaf/internal allocation sizes for the benchmark key/value type.
+- Compare Abseil and Zig benchmark tree shape after insert: height, leaf nodes, internal nodes, fullness or equivalent occupancy, and bytes per stored item where available.
+- Inspect or generate local optimized assembly for the Abseil range-for iteration loop and the Zig benchmark iteration loop. Record only the specific differences that plausibly affect the measured gap.
+- If using profiling tools such as `perf stat`, `perf record`, `objdump`, or compiler emitted assembly, record the exact commands and enough output to support the conclusion.
+- Build a gap-attribution table that ranks likely causes by evidence strength and estimated impact:
+  - tree shape and occupancy
+  - leaf/internal allocation size
+  - iterator hot-path branches and loads
+  - parent traversal frequency
+  - internal separator-entry traversal
+  - generated code quality and inlining
+  - benchmark harness differences
 
 Record source-inspection findings in `checkpoints.md` before making performance changes.
 
@@ -103,12 +153,15 @@ Prefer production architecture improvements over benchmark-only shortcuts.
 
 Likely areas to evaluate:
 
+- Match Abseil's proven behavior where it directly explains the measured gap.
 - Add a forward-iteration fast path that stays within a leaf while possible and minimizes parent traversal when a leaf is exhausted.
 - Add leaf predecessor/successor links if they materially reduce iteration overhead and can be maintained safely through split, merge, borrow, root shrink, and clear.
 - Evaluate whether a B+ tree/value-in-leaf design is required to meet the 20% iteration target, and document the migration plan if so.
 - Revisit iterator representation so the common forward iterator does not carry unnecessary cursor functionality.
 - Use cached leftmost/rightmost leaf pointers if they remove repeated descent or simplify begin/end.
 - Reduce iterator overhead by fast-pathing within-node advancement and minimizing parent traversal.
+- Reduce node metadata footprint or optional child-pointer overhead if Abseil source/codegen evidence shows it contributes materially.
+- Change insertion rebalancing, split policy, or node sizing only when tree-shape evidence shows it is a major remaining contributor.
 - Keep insert, remove, split, merge, and borrow maintenance costs bounded when adding iteration metadata.
 - Add targeted inline hints only when the generated code and measurements show a real improvement.
 
@@ -177,6 +230,13 @@ Use at least seven local samples for the pre-change baseline and final audit. Fi
 
 Primary pass/fail is based on `iterate`. The other workloads are regression guards.
 
+Required diagnostic measurements before major architecture changes:
+
+- Zig and Abseil tree-shape/occupancy measurements after building the benchmark tree.
+- A focused iteration-only timing that excludes insert, lookup, and remove setup noise where practical.
+- At least one codegen or profiling artifact comparing Zig and Abseil iteration hot paths.
+- A written explanation of which measured difference is expected to close the gap and why.
+
 ## Checkpoint Requirements
 
 Update `checkpoints.md` after every meaningful step.
@@ -198,6 +258,7 @@ Each checkpoint must include:
 Required checkpoints:
 
 - source inspection of Zig and Abseil B-tree paths
+- Abseil deep-dive gap attribution with source locations and local evidence
 - fresh pre-change local aarch64 median baseline
 - first iteration hot-path optimization
 - first correctness milestone after optimization
@@ -212,6 +273,8 @@ Produce a final `checkpoints.md` entry summarizing:
 - starting local aarch64 Zig performance
 - ending local aarch64 Zig performance
 - C++ Abseil comparison and percentage gap for each workload
+- the diagnosed root cause or ranked root causes of the remaining gap
+- Abseil source locations and local evidence supporting that diagnosis
 - explicit `iterate` target calculation and pass/fail status
 - correctness verification
 - allocation-failure verification
@@ -221,4 +284,4 @@ Produce a final `checkpoints.md` entry summarizing:
 Stop only when either:
 
 - Zig `iterate` is within 20% of C++ Abseil on local aarch64 medians, `insert`/`lookup`/`remove` regressions are within the documented guardrails, and correctness gates are green, or
-- reaching the 20% `iterate` target requires a larger architecture change, and `checkpoints.md` clearly explains the blocker and proposed next design.
+- reaching the 20% `iterate` target requires a larger architecture change, and `checkpoints.md` clearly explains the blocker, the Abseil-backed reason for the blocker, and the proposed next design.

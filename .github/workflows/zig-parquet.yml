@@ -1,0 +1,57 @@
+name: zig_parquet
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    env:
+      ZIG_VERSION: 0.17.0-dev.135+9df02121d
+      ZIG: .toolchains/zig-x86_64-linux-0.17.0-dev.135+9df02121d/zig
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl xz-utils python3
+
+      - name: Install uv
+        run: |
+          python3 -m pip install --user uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download pinned Zig toolchain
+        run: |
+          mkdir -p .toolchains
+          curl -fsSL "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o ".toolchains/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar -C .toolchains -xf ".toolchains/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          "${ZIG}" version
+
+      - name: Run Zig tests
+        run: |
+          "${ZIG}" build parquet-test -Doptimize=Debug --summary all
+          "${ZIG}" build parquet-test -Doptimize=ReleaseSafe --summary all
+          "${ZIG}" build test -Doptimize=Debug --summary all
+
+      - name: Build ReleaseFast fixtures
+        run: '"${ZIG}" build -Doptimize=ReleaseFast --summary all'
+
+      - name: Run PyArrow compatibility
+        run: uv run --with pyarrow python zig_parquet/tools/verify_pyarrow.py
+
+      - name: Run PyArrow digest fuzz
+        run: uv run --with pyarrow python zig_parquet/tools/fuzz_digest.py
+
+      - name: Run corrupt-file smoke
+        run: uv run python zig_parquet/tools/corrupt_smoke.py
+
+      - name: Run throughput harness
+        run: uv run --with pyarrow python zig_parquet/tools/bench_parquet.py --skip-build --rows 250000

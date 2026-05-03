@@ -21,7 +21,7 @@ pub const Config = struct {
     /// Lower bound on max keys per node.  Five gives min degree three, avoiding
     /// the poor occupancy of tiny B-trees.
     min_max_slots: usize = 5,
-    /// Upper bound on max keys per node.  Kept within u16 position fields.
+    /// Upper bound on max keys per node.  Kept within u8 position fields.
     max_max_slots: usize = 255,
     /// Use linear search inside small nodes; binary search above this size.
     linear_search_threshold: usize = 16,
@@ -71,29 +71,68 @@ pub fn BTreeMap(
         pub const max_node_slots: usize = max_slots;
         pub const min_node_slots: usize = min_slots;
 
-        const Node = struct {
+        const internal_node_max_count: u8 = 0;
+
+        const NodeHeader = extern struct {
             parent: ?*Node,
-            position: u16,
-            len: u16,
-            leaf: bool,
+            position: u8,
+            start: u8,
+            finish: u8,
+            max_count: u8,
+        };
+
+        const Node = struct {
+            header: NodeHeader,
             entries: [max_slots]Entry,
-            children: ?*[max_slots + 1]?*Node,
 
             fn init(leaf: bool, parent: ?*Node, position: usize) Node {
                 return .{
-                    .parent = parent,
-                    .position = narrowPos(position),
-                    .len = 0,
-                    .leaf = leaf,
+                    .header = .{
+                        .parent = parent,
+                        .position = narrowPos(position),
+                        .start = 0,
+                        .finish = 0,
+                        .max_count = if (leaf) narrowLen(max_slots) else internal_node_max_count,
+                    },
                     .entries = undefined,
-                    .children = null,
                 };
             }
 
+            fn isLeaf(n: *const Node) bool {
+                return n.header.max_count != internal_node_max_count;
+            }
+
             fn count(n: *const Node) usize {
-                return @as(usize, n.len);
+                std.debug.assert(n.header.finish >= n.header.start);
+                return @as(usize, n.header.finish - n.header.start);
+            }
+
+            fn capacity(n: *const Node) usize {
+                return if (n.isLeaf()) @as(usize, n.header.max_count) else max_slots;
+            }
+
+            fn childArray(n: *Node) *[max_slots + 1]?*Node {
+                std.debug.assert(!n.isLeaf());
+                const internal: *InternalNode = @fieldParentPtr("node", n);
+                return &internal.children;
+            }
+
+            fn childArrayConst(n: *const Node) *const [max_slots + 1]?*Node {
+                std.debug.assert(!n.isLeaf());
+                const internal: *const InternalNode = @fieldParentPtr("node", n);
+                return &internal.children;
             }
         };
+
+        const InternalNode = struct {
+            node: Node,
+            children: [max_slots + 1]?*Node,
+        };
+
+        pub const node_entry_offset: usize = @offsetOf(Node, "entries");
+        pub const leaf_node_size: usize = @sizeOf(Node);
+        pub const internal_node_size: usize = @sizeOf(InternalNode);
+        pub const child_array_offset: usize = @offsetOf(InternalNode, "children");
 
         pub const InsertResult = struct {
             entry: *Entry,
@@ -181,9 +220,9 @@ pub fn BTreeMap(
                 pub inline fn advance(c: *C) void {
                     c.assertValid();
                     const start = c.node orelse return;
-                    if (!start.leaf) {
+                    if (!start.isLeaf()) {
                         var n = childAt(start, c.index + 1);
-                        while (!n.leaf) n = childAt(n, 0);
+                        while (!n.isLeaf()) n = childAt(n, 0);
                         c.node = n;
                         c.index = 0;
                         return;
@@ -193,8 +232,8 @@ pub fn BTreeMap(
                         return;
                     }
                     var n = start;
-                    while (n.parent) |p| {
-                        const pos = @as(usize, n.position);
+                    while (n.header.parent) |p| {
+                        const pos = @as(usize, n.header.position);
                         if (pos < p.count()) {
                             c.node = p;
                             c.index = pos;
@@ -213,9 +252,9 @@ pub fn BTreeMap(
                         if (c.node) |n| c.index = n.count() - 1;
                         return;
                     };
-                    if (!start.leaf) {
+                    if (!start.isLeaf()) {
                         var n = childAt(start, c.index);
-                        while (!n.leaf) n = childAt(n, n.count());
+                        while (!n.isLeaf()) n = childAt(n, n.count());
                         c.node = n;
                         c.index = n.count() - 1;
                         return;
@@ -225,8 +264,8 @@ pub fn BTreeMap(
                         return;
                     }
                     var n = start;
-                    while (n.parent) |p| {
-                        const pos = @as(usize, n.position);
+                    while (n.header.parent) |p| {
+                        const pos = @as(usize, n.header.position);
                         if (pos > 0) {
                             c.node = p;
                             c.index = pos - 1;
@@ -246,45 +285,128 @@ pub fn BTreeMap(
             };
         }
 
-        pub const Iterator = struct {
-            cursor: Cursor,
+        pub const Iterator = IteratorImpl(*Self, *Node, *Entry, .forward);
+        pub const ConstIterator = IteratorImpl(*const Self, *const Node, *const Entry, .forward);
+        pub const ReverseIterator = IteratorImpl(*Self, *Node, *Entry, .reverse);
+        pub const ConstReverseIterator = IteratorImpl(*const Self, *const Node, *const Entry, .reverse);
 
-            pub inline fn next(it: *Iterator) ?*Entry {
-                return it.cursor.next();
-            }
-        };
+        const IteratorDirection = enum { forward, reverse };
 
-        pub const ConstIterator = struct {
-            cursor: ConstCursor,
+        fn IteratorImpl(
+            comptime TreePtr: type,
+            comptime NodePtr: type,
+            comptime EntryPtr: type,
+            comptime direction: IteratorDirection,
+        ) type {
+            const check_generation = config.check_iterator_generation and safetyChecks();
+            const StoredTreePtr = if (check_generation) TreePtr else void;
+            const StoredGeneration = if (check_generation) usize else void;
 
-            pub inline fn next(it: *ConstIterator) ?*const Entry {
-                return it.cursor.next();
-            }
-        };
+            return struct {
+                const I = @This();
 
-        pub const ReverseIterator = struct {
-            cursor: Cursor,
+                tree: StoredTreePtr,
+                node: ?NodePtr,
+                index: u8,
+                end: u8,
+                generation: StoredGeneration,
 
-            pub inline fn next(it: *ReverseIterator) ?*Entry {
-                it.cursor.assertValid();
-                const n = it.cursor.node orelse return null;
-                const out_index = it.cursor.index;
-                it.cursor.retreat();
-                return &n.entries[out_index];
-            }
-        };
+                fn init(tree: TreePtr, node: ?NodePtr, index: usize) I {
+                    return .{
+                        .tree = if (check_generation) tree else {},
+                        .node = node,
+                        .index = narrowPos(index),
+                        .end = if (node) |n| n.header.finish else 0,
+                        .generation = if (check_generation) tree.generation else {},
+                    };
+                }
 
-        pub const ConstReverseIterator = struct {
-            cursor: ConstCursor,
+                pub inline fn next(it: *I) ?EntryPtr {
+                    it.assertValid();
+                    const n = it.node orelse {
+                        @branchHint(.unlikely);
+                        return null;
+                    };
+                    const idx = @as(usize, it.index);
+                    const out = &n.entries[idx];
+                    switch (direction) {
+                        .forward => it.advanceFrom(n, idx),
+                        .reverse => it.retreatFrom(n, idx),
+                    }
+                    return out;
+                }
 
-            pub inline fn next(it: *ConstReverseIterator) ?*const Entry {
-                it.cursor.assertValid();
-                const n = it.cursor.node orelse return null;
-                const out_index = it.cursor.index;
-                it.cursor.retreat();
-                return &n.entries[out_index];
-            }
-        };
+                inline fn advanceFrom(it: *I, start: NodePtr, idx: usize) void {
+                    if (start.isLeaf()) {
+                        if (idx + 1 < @as(usize, it.end)) {
+                            @branchHint(.likely);
+                            it.index = narrowPos(idx + 1);
+                            return;
+                        }
+                    } else {
+                        @branchHint(.unlikely);
+                        var n = childAt(start, idx + 1);
+                        while (!n.isLeaf()) n = childAt(n, 0);
+                        it.node = n;
+                        it.index = 0;
+                        it.end = n.header.finish;
+                        return;
+                    }
+                    var n = start;
+                    while (n.header.parent) |p| {
+                        const pos = @as(usize, n.header.position);
+                        if (pos < p.count()) {
+                            it.node = p;
+                            it.index = narrowPos(pos);
+                            it.end = p.header.finish;
+                            return;
+                        }
+                        n = p;
+                    }
+                    it.node = null;
+                    it.index = 0;
+                    it.end = 0;
+                }
+
+                inline fn retreatFrom(it: *I, start: NodePtr, idx: usize) void {
+                    if (start.isLeaf()) {
+                        if (idx > 0) {
+                            @branchHint(.likely);
+                            it.index = narrowPos(idx - 1);
+                            return;
+                        }
+                    } else {
+                        @branchHint(.unlikely);
+                        var n = childAt(start, idx);
+                        while (!n.isLeaf()) n = childAt(n, n.count());
+                        it.node = n;
+                        it.index = narrowPos(n.count() - 1);
+                        it.end = n.header.finish;
+                        return;
+                    }
+                    var n = start;
+                    while (n.header.parent) |p| {
+                        const pos = @as(usize, n.header.position);
+                        if (pos > 0) {
+                            it.node = p;
+                            it.index = narrowPos(pos - 1);
+                            it.end = p.header.finish;
+                            return;
+                        }
+                        n = p;
+                    }
+                    it.node = null;
+                    it.index = 0;
+                    it.end = 0;
+                }
+
+                inline fn assertValid(it: I) void {
+                    if (check_generation) {
+                        std.debug.assert(it.generation == it.tree.generation);
+                    }
+                }
+            };
+        }
 
         allocator: Allocator,
         context: Context,
@@ -325,41 +447,42 @@ pub fn BTreeMap(
             return self.len_ == 0;
         }
 
-        pub fn contains(self: *const Self, key_: Key) bool {
+        pub inline fn contains(self: *const Self, key_: Key) bool {
             return self.getEntryConst(key_) != null;
         }
 
-        pub fn get(self: *Self, key_: Key) ?*Value {
+        pub inline fn get(self: *Self, key_: Key) ?*Value {
             const e = self.getEntry(key_) orelse return null;
             return &e.value;
         }
 
-        pub fn getConst(self: *const Self, key_: Key) ?*const Value {
+        pub inline fn getConst(self: *const Self, key_: Key) ?*const Value {
             const c = self.findCursor(key_);
             const e = c.entry() orelse return null;
             return &e.value;
         }
 
-        pub fn getEntry(self: *Self, key_: Key) ?*Entry {
+        pub inline fn getEntry(self: *Self, key_: Key) ?*Entry {
             const c = self.findCursorMut(key_);
             return c.entry();
         }
 
-        pub fn getEntryConst(self: *const Self, key_: Key) ?*const Entry {
+        pub inline fn getEntryConst(self: *const Self, key_: Key) ?*const Entry {
             const c = self.findCursor(key_);
             return c.entry();
         }
 
         /// Insert only when key is absent.  Does not overwrite an existing value.
-        pub fn insert(self: *Self, key_: Key, value_: Value) Allocator.Error!InsertResult {
+        pub inline fn insert(self: *Self, key_: Key, value_: Value) Allocator.Error!InsertResult {
             return self.insertEntry(.{ .key = key_, .value = value_ });
         }
 
         pub fn insertEntry(self: *Self, entry_: Entry) Allocator.Error!InsertResult {
             if (self.root == null) {
+                @branchHint(.unlikely);
                 const r = try self.newNode(true, null, 0);
                 r.entries[0] = entry_;
-                r.len = 1;
+                r.header.finish = 1;
                 self.root = r;
                 self.len_ = 1;
                 self.bumpGeneration();
@@ -367,6 +490,7 @@ pub fn BTreeMap(
             }
 
             if (self.root.?.count() == max_slots) {
+                @branchHint(.unlikely);
                 if (self.getEntry(entry_.key)) |existing| {
                     return .{ .entry = existing, .inserted = false };
                 }
@@ -374,27 +498,43 @@ pub fn BTreeMap(
             }
 
             var n = self.root.?;
-            while (!n.leaf) {
+            while (!n.isLeaf()) {
                 var i = self.lowerBoundInNode(n, &entry_.key);
                 if (i < n.count() and self.keysEqual(&entry_.key, &n.entries[i].key)) {
+                    @branchHint(.unlikely);
                     return .{ .entry = &n.entries[i], .inserted = false };
                 }
                 var child = childAt(n, i);
                 if (child.count() == max_slots) {
+                    @branchHint(.unlikely);
                     if (self.findEntryInSubtree(child, &entry_.key)) |existing| {
                         return .{ .entry = existing, .inserted = false };
                     }
-                    try self.splitChild(n, i);
-                    if (self.less(&n.entries[i].key, &entry_.key)) {
-                        i += 1;
+                    if (self.rebalanceFullChildBeforeInsert(n, i, &entry_.key)) |rebalanced_child| {
+                        _ = rebalanced_child;
+                        i = self.lowerBoundInNode(n, &entry_.key);
+                        if (i < n.count() and self.keysEqual(&entry_.key, &n.entries[i].key)) {
+                            @branchHint(.unlikely);
+                            return .{ .entry = &n.entries[i], .inserted = false };
+                        }
+                        child = childAt(n, i);
+                    } else {
+                        try self.splitChild(n, i);
+                        if (self.keysEqual(&n.entries[i].key, &entry_.key)) {
+                            return .{ .entry = &n.entries[i], .inserted = false };
+                        }
+                        if (self.less(&n.entries[i].key, &entry_.key)) {
+                            i += 1;
+                        }
+                        child = childAt(n, i);
                     }
-                    child = childAt(n, i);
                 }
                 n = child;
             }
 
             const pos = self.lowerBoundInNode(n, &entry_.key);
             if (pos < n.count() and self.keysEqual(&entry_.key, &n.entries[pos].key)) {
+                @branchHint(.unlikely);
                 return .{ .entry = &n.entries[pos], .inserted = false };
             }
             insertEntryAt(n, pos, entry_);
@@ -404,7 +544,7 @@ pub fn BTreeMap(
         }
 
         /// Insert or replace.  Returns the old value when a replacement occurs.
-        pub fn put(self: *Self, key_: Key, value_: Value) Allocator.Error!PutResult {
+        pub inline fn put(self: *Self, key_: Key, value_: Value) Allocator.Error!PutResult {
             const res = try self.insert(key_, value_);
             if (res.inserted) {
                 return .{ .entry = res.entry, .inserted = true, .old_value = null };
@@ -416,18 +556,21 @@ pub fn BTreeMap(
         }
 
         /// Return a pointer to the value for key, inserting default_value if absent.
-        pub fn getOrPutValue(self: *Self, key_: Key, default_value: Value) Allocator.Error!InsertResult {
+        pub inline fn getOrPutValue(self: *Self, key_: Key, default_value: Value) Allocator.Error!InsertResult {
             return self.insert(key_, default_value);
         }
 
-        pub fn remove(self: *Self, key_: Key) bool {
+        pub inline fn remove(self: *Self, key_: Key) bool {
             if (self.root == null) return false;
-            const removed = self.deleteFromNode(self.root.?, &key_);
+            var mutated = false;
+            const removed = self.deleteFromNode(self.root.?, &key_, &mutated);
             if (removed) {
                 self.len_ -= 1;
-                self.fixRootAfterDelete();
+            }
+            if (removed or mutated) {
                 self.bumpGeneration();
             }
+            self.fixRootAfterDelete();
             return removed;
         }
 
@@ -447,7 +590,7 @@ pub fn BTreeMap(
             while (n_opt) |n| {
                 const i = self.lowerBoundInNode(n, &key_);
                 if (i < n.count()) last_internal = .{ .node = n, .index = i };
-                if (n.leaf) {
+                if (n.isLeaf()) {
                     if (i < n.count()) return self.cursorAtConst(n, i);
                     if (last_internal) |li| return self.cursorAtConst(li.node, li.index);
                     return self.endCursor();
@@ -464,7 +607,7 @@ pub fn BTreeMap(
             while (n_opt) |n| {
                 const i = self.lowerBoundInNode(n, &key_);
                 if (i < n.count()) last_internal = .{ .node = n, .index = i };
-                if (n.leaf) {
+                if (n.isLeaf()) {
                     if (i < n.count()) return self.cursorAt(n, i);
                     if (last_internal) |li| return self.cursorAt(li.node, li.index);
                     return self.endCursorMut();
@@ -481,7 +624,7 @@ pub fn BTreeMap(
             while (n_opt) |n| {
                 const i = self.upperBoundInNode(n, &key_);
                 if (i < n.count()) last_internal = .{ .node = n, .index = i };
-                if (n.leaf) {
+                if (n.isLeaf()) {
                     if (i < n.count()) return self.cursorAtConst(n, i);
                     if (last_internal) |li| return self.cursorAtConst(li.node, li.index);
                     return self.endCursor();
@@ -498,7 +641,7 @@ pub fn BTreeMap(
             while (n_opt) |n| {
                 const i = self.upperBoundInNode(n, &key_);
                 if (i < n.count()) last_internal = .{ .node = n, .index = i };
-                if (n.leaf) {
+                if (n.isLeaf()) {
                     if (i < n.count()) return self.cursorAt(n, i);
                     if (last_internal) |li| return self.cursorAt(li.node, li.index);
                     return self.endCursorMut();
@@ -515,7 +658,7 @@ pub fn BTreeMap(
                 if (i < n.count() and self.keysEqual(&key_, &n.entries[i].key)) {
                     return self.cursorAtConst(n, i);
                 }
-                if (n.leaf) break;
+                if (n.isLeaf()) break;
                 n_opt = childAt(n, i);
             }
             return self.endCursor();
@@ -528,28 +671,28 @@ pub fn BTreeMap(
                 if (i < n.count() and self.keysEqual(&key_, &n.entries[i].key)) {
                     return self.cursorAt(n, i);
                 }
-                if (n.leaf) break;
+                if (n.isLeaf()) break;
                 n_opt = childAt(n, i);
             }
             return self.endCursorMut();
         }
 
         pub fn iterator(self: *Self) Iterator {
-            return .{ .cursor = self.beginCursor() };
+            return Iterator.init(self, self.leftmostNode(), 0);
         }
 
         pub fn constIterator(self: *const Self) ConstIterator {
-            return .{ .cursor = self.beginConstCursor() };
+            return ConstIterator.init(self, self.leftmostNode(), 0);
         }
 
         pub fn reverseIterator(self: *Self) ReverseIterator {
-            const n = self.rightmostNode() orelse return .{ .cursor = self.endCursorMut() };
-            return .{ .cursor = self.cursorAt(n, n.count() - 1) };
+            const n = self.rightmostNode() orelse return ReverseIterator.init(self, null, 0);
+            return ReverseIterator.init(self, n, n.count() - 1);
         }
 
         pub fn constReverseIterator(self: *const Self) ConstReverseIterator {
-            const n = self.rightmostNode() orelse return .{ .cursor = self.endCursor() };
-            return .{ .cursor = self.cursorAtConst(n, n.count() - 1) };
+            const n = self.rightmostNode() orelse return ConstReverseIterator.init(self, null, 0);
+            return ConstReverseIterator.init(self, n, n.count() - 1);
         }
 
         pub fn beginCursor(self: *Self) Cursor {
@@ -575,7 +718,7 @@ pub fn BTreeMap(
             var n_opt = self.root;
             while (n_opt) |n| {
                 h += 1;
-                if (n.leaf) break;
+                if (n.isLeaf()) break;
                 n_opt = childAt(n, 0);
             }
             return h;
@@ -596,7 +739,7 @@ pub fn BTreeMap(
                 .max_node_slots = max_slots,
                 .min_node_slots = min_slots,
                 .fullness = if (cap == 0) 0 else @as(f64, @floatFromInt(self.len_)) / @as(f64, @floatFromInt(cap)),
-                .bytes_used = @sizeOf(Self) + node_count * @sizeOf(Node) + internal_nodes * @sizeOf([max_slots + 1]?*Node),
+                .bytes_used = @sizeOf(Self) + leaf_nodes * @sizeOf(Node) + internal_nodes * @sizeOf(InternalNode),
             };
         }
 
@@ -607,7 +750,7 @@ pub fn BTreeMap(
                 return;
             }
             const r = self.root.?;
-            std.debug.assert(r.parent == null);
+            std.debug.assert(r.header.parent == null);
             std.debug.assert(r.count() > 0);
             std.debug.assert(r.count() <= max_slots);
             var counted: usize = 0;
@@ -625,44 +768,50 @@ pub fn BTreeMap(
         }
 
         fn newNode(self: *Self, leaf: bool, parent: ?*Node, position: usize) Allocator.Error!*Node {
-            const n = try self.allocator.create(Node);
-            errdefer self.allocator.destroy(n);
-            const children = if (leaf) null else children: {
-                const ptr = try self.allocator.create([max_slots + 1]?*Node);
-                ptr.* = [_]?*Node{null} ** (max_slots + 1);
-                break :children ptr;
+            if (leaf) {
+                const n = try self.allocator.create(Node);
+                n.* = Node.init(true, parent, position);
+                return n;
+            }
+            const internal = try self.allocator.create(InternalNode);
+            internal.* = .{
+                .node = Node.init(false, parent, position),
+                .children = [_]?*Node{null} ** (max_slots + 1),
             };
-            n.* = Node.init(leaf, parent, position);
-            n.children = children;
-            return n;
+            return &internal.node;
         }
 
         fn destroySubtree(self: *Self, n: *Node) void {
-            if (!n.leaf) {
+            if (!n.isLeaf()) {
                 var i: usize = 0;
+                const children = n.childArray();
                 while (i <= n.count()) : (i += 1) {
-                    if (n.children.?[i]) |c| self.destroySubtree(c);
+                    if (children[i]) |c| self.destroySubtree(c);
                 }
             }
             self.destroyNode(n);
         }
 
         fn destroyNode(self: *Self, n: *Node) void {
-            if (n.children) |children| self.allocator.destroy(children);
-            self.allocator.destroy(n);
+            if (n.isLeaf()) {
+                self.allocator.destroy(n);
+                return;
+            }
+            const internal: *InternalNode = @fieldParentPtr("node", n);
+            self.allocator.destroy(internal);
         }
 
         fn growRoot(self: *Self) Allocator.Error!void {
             const old = self.root.?;
             const new_root = try self.newNode(false, null, 0);
-            old.parent = new_root;
-            old.position = 0;
-            new_root.children.?[0] = old;
+            old.header.parent = new_root;
+            old.header.position = 0;
+            new_root.childArray()[0] = old;
             self.root = new_root;
             self.splitChild(new_root, 0) catch |err| {
-                old.parent = null;
-                old.position = 0;
-                new_root.children.?[0] = null;
+                old.header.parent = null;
+                old.header.position = 0;
+                new_root.childArray()[0] = null;
                 self.root = old;
                 self.destroyNode(new_root);
                 return err;
@@ -674,7 +823,7 @@ pub fn BTreeMap(
             const left = childAt(parent, child_index);
             std.debug.assert(left.count() == max_slots);
 
-            const right = try self.newNode(left.leaf, parent, child_index + 1);
+            const right = try self.newNode(left.isLeaf(), parent, child_index + 1);
             const median_index = min_slots;
             const right_len = max_slots - median_index - 1;
 
@@ -682,46 +831,74 @@ pub fn BTreeMap(
             while (j < right_len) : (j += 1) {
                 right.entries[j] = left.entries[median_index + 1 + j];
             }
-            if (!left.leaf) {
+            if (!left.isLeaf()) {
                 j = 0;
+                const left_children = left.childArray();
+                const right_children = right.childArray();
                 while (j <= right_len) : (j += 1) {
-                    const c = left.children.?[median_index + 1 + j].?;
-                    right.children.?[j] = c;
-                    c.parent = right;
-                    c.position = narrowPos(j);
-                    left.children.?[median_index + 1 + j] = null;
+                    const c = left_children[median_index + 1 + j].?;
+                    right_children[j] = c;
+                    c.header.parent = right;
+                    c.header.position = narrowPos(j);
+                    left_children[median_index + 1 + j] = null;
                 }
             }
-            right.len = narrowLen(right_len);
+            right.header.finish = narrowLen(right_len);
             const median = left.entries[median_index];
-            left.len = narrowLen(median_index);
+            left.header.finish = narrowLen(median_index);
 
             shiftChildrenRight(parent, child_index + 1);
-            parent.children.?[child_index + 1] = right;
+            parent.childArray()[child_index + 1] = right;
             shiftEntriesRight(parent, child_index);
             parent.entries[child_index] = median;
-            parent.len += 1;
+            parent.header.finish += 1;
             fixChildPositions(parent, child_index + 1);
         }
 
-        fn deleteFromNode(self: *Self, n: *Node, key_: *const Key) bool {
+        fn rebalanceFullChildBeforeInsert(self: *const Self, parent: *Node, child_index: usize, key_: *const Key) ?*Node {
+            const child = childAt(parent, child_index);
+            const insert_pos = self.lowerBoundInNode(child, key_);
+            if (insert_pos > 0 and child_index > 0 and childAt(parent, child_index - 1).count() < max_slots) {
+                const left = childAt(parent, child_index - 1);
+                const movable = @min(max_slots - left.count(), insert_pos);
+                const to_move = @max(@as(usize, 1), movable / 2);
+                var moved: usize = 0;
+                while (moved < to_move) : (moved += 1) {
+                    borrowFromRight(parent, child_index - 1);
+                }
+                return childAt(parent, child_index);
+            }
+            if (insert_pos < child.count() and child_index < parent.count() and childAt(parent, child_index + 1).count() < max_slots) {
+                const right = childAt(parent, child_index + 1);
+                const movable = @min(max_slots - right.count(), child.count() - insert_pos);
+                const to_move = @max(@as(usize, 1), movable / 2);
+                var moved: usize = 0;
+                while (moved < to_move) : (moved += 1) {
+                    borrowFromLeft(parent, child_index + 1);
+                }
+                return childAt(parent, child_index);
+            }
+            return null;
+        }
+
+        fn deleteFromNode(self: *Self, n: *Node, key_: *const Key, mutated: *bool) bool {
             const idx = self.lowerBoundInNode(n, key_);
             if (idx < n.count() and self.keysEqual(key_, &n.entries[idx].key)) {
-                if (n.leaf) {
+                if (n.isLeaf()) {
                     removeEntryAt(n, idx);
                     return true;
                 }
                 return self.deleteFromInternal(n, idx);
             }
-            if (n.leaf) return false;
+            if (n.isLeaf()) return false;
 
             const child_index = idx;
             var child = childAt(n, child_index);
             if (child.count() == min_slots) {
-                if (!self.containsInSubtree(child, key_)) return false;
+                mutated.* = true;
                 child = self.fillChild(n, child_index);
             }
-            return self.deleteFromNode(child, key_);
+            return self.deleteFromNode(child, key_, mutated);
         }
 
         fn containsInSubtree(self: *const Self, start: *const Node, key_: *const Key) bool {
@@ -733,7 +910,7 @@ pub fn BTreeMap(
             while (true) {
                 const i = self.lowerBoundInNode(n, key_);
                 if (i < n.count() and self.keysEqual(key_, &n.entries[i].key)) return &n.entries[i];
-                if (n.leaf) return null;
+                if (n.isLeaf()) return null;
                 n = childAt(n, i);
             }
         }
@@ -756,7 +933,7 @@ pub fn BTreeMap(
 
         fn removeMin(self: *Self, start: *Node) Entry {
             var n = start;
-            while (!n.leaf) {
+            while (!n.isLeaf()) {
                 var child = childAt(n, 0);
                 if (child.count() == min_slots) {
                     child = self.fillChild(n, 0);
@@ -770,7 +947,7 @@ pub fn BTreeMap(
 
         fn removeMax(self: *Self, start: *Node) Entry {
             var n = start;
-            while (!n.leaf) {
+            while (!n.isLeaf()) {
                 const idx = n.count();
                 var child = childAt(n, idx);
                 if (child.count() == min_slots) {
@@ -780,12 +957,12 @@ pub fn BTreeMap(
             }
             const last = n.count() - 1;
             const out = n.entries[last];
-            n.len -= 1;
+            n.header.finish -= 1;
             return out;
         }
 
         fn removeEntryAtKnownPresent(self: *Self, n: *Node, idx: usize) bool {
-            if (n.leaf) {
+            if (n.isLeaf()) {
                 removeEntryAt(n, idx);
                 return true;
             }
@@ -822,7 +999,7 @@ pub fn BTreeMap(
         fn mergeChildren(self: *Self, parent: *Node, left_index: usize) *Node {
             const left = childAt(parent, left_index);
             const right = childAt(parent, left_index + 1);
-            std.debug.assert(left.leaf == right.leaf);
+            std.debug.assert(left.isLeaf() == right.isLeaf());
             std.debug.assert(left.count() + 1 + right.count() <= max_slots);
 
             const left_len = left.count();
@@ -831,16 +1008,18 @@ pub fn BTreeMap(
             while (j < right.count()) : (j += 1) {
                 left.entries[left_len + 1 + j] = right.entries[j];
             }
-            if (!left.leaf) {
+            if (!left.isLeaf()) {
                 j = 0;
+                const right_children = right.childArray();
+                const left_children = left.childArray();
                 while (j <= right.count()) : (j += 1) {
-                    const c = right.children.?[j].?;
-                    left.children.?[left_len + 1 + j] = c;
-                    c.parent = left;
-                    c.position = narrowPos(left_len + 1 + j);
+                    const c = right_children[j].?;
+                    left_children[left_len + 1 + j] = c;
+                    c.header.parent = left;
+                    c.header.position = narrowPos(left_len + 1 + j);
                 }
             }
-            left.len = narrowLen(left_len + 1 + right.count());
+            left.header.finish = narrowLen(left_len + 1 + right.count());
 
             removeEntryAt(parent, left_index);
             removeChildAt(parent, left_index + 1);
@@ -852,26 +1031,27 @@ pub fn BTreeMap(
         fn fixRootAfterDelete(self: *Self) void {
             const r = self.root orelse return;
             if (r.count() != 0) return;
-            if (r.leaf) {
+            if (r.isLeaf()) {
                 self.destroyNode(r);
                 self.root = null;
                 return;
             }
             const child = childAt(r, 0);
-            child.parent = null;
-            child.position = 0;
+            child.header.parent = null;
+            child.header.position = 0;
             self.root = child;
             self.destroyNode(r);
         }
 
         inline fn lowerBoundInNode(self: *const Self, n: *const Node, key_: *const Key) usize {
+            const node_len = n.count();
             if (max_slots <= config.linear_search_threshold) {
                 var i: usize = 0;
-                while (i < n.count() and self.less(&n.entries[i].key, key_)) : (i += 1) {}
+                while (i < node_len and self.less(&n.entries[i].key, key_)) : (i += 1) {}
                 return i;
             }
             var lo: usize = 0;
-            var hi: usize = n.count();
+            var hi: usize = node_len;
             while (lo < hi) {
                 const mid = (lo + hi) / 2;
                 if (self.less(&n.entries[mid].key, key_)) lo = mid + 1 else hi = mid;
@@ -880,13 +1060,14 @@ pub fn BTreeMap(
         }
 
         inline fn upperBoundInNode(self: *const Self, n: *const Node, key_: *const Key) usize {
+            const node_len = n.count();
             if (max_slots <= config.linear_search_threshold) {
                 var i: usize = 0;
-                while (i < n.count() and !self.less(key_, &n.entries[i].key)) : (i += 1) {}
+                while (i < node_len and !self.less(key_, &n.entries[i].key)) : (i += 1) {}
                 return i;
             }
             var lo: usize = 0;
-            var hi: usize = n.count();
+            var hi: usize = node_len;
             while (lo < hi) {
                 const mid = (lo + hi) / 2;
                 if (!self.less(key_, &n.entries[mid].key)) lo = mid + 1 else hi = mid;
@@ -896,13 +1077,13 @@ pub fn BTreeMap(
 
         fn leftmostNode(self: *const Self) ?*Node {
             var n = self.root orelse return null;
-            while (!n.leaf) n = childAt(n, 0);
+            while (!n.isLeaf()) n = childAt(n, 0);
             return n;
         }
 
         fn rightmostNode(self: *const Self) ?*Node {
             var n = self.root orelse return null;
-            while (!n.leaf) n = childAt(n, n.count());
+            while (!n.isLeaf()) n = childAt(n, n.count());
             return n;
         }
 
@@ -1103,12 +1284,12 @@ fn defaultContext(comptime Context: type) Context {
 fn deriveMaxSlots(comptime Entry: type, comptime config: Config) usize {
     const ptr_size = @sizeOf(?*anyopaque);
     const entry_size = @max(@sizeOf(Entry), 1);
-    const header_estimate = ptr_size + @sizeOf(u16) * 2 + @sizeOf(bool) + ptr_size;
+    const unaligned_header = ptr_size + @sizeOf(u8) * 4;
+    const entry_align = @alignOf(Entry);
+    const header_estimate = ((unaligned_header + entry_align - 1) / entry_align) * entry_align;
     // Abseil derives target slots from leaf-node payload: leaf nodes dominate
-    // node count and do not carry child pointers in Abseil's layout.  This
-    // implementation still uses a single node shape for now, but deriving
-    // slots from entries preserves Abseil-like fanout and avoids underfilled
-    // trees for common map entries such as u64 -> u64.
+    // node count and do not carry child pointers.  Zig now follows that split
+    // layout, with child pointers present only in internal-node allocations.
     const per_slot_estimate = entry_size;
     var raw: usize = if (config.target_node_size > header_estimate)
         (config.target_node_size - header_estimate) / per_slot_estimate
@@ -1119,7 +1300,7 @@ fn deriveMaxSlots(comptime Entry: type, comptime config: Config) usize {
     if (raw < 3) raw = 3;
     if (raw % 2 == 0) raw -= 1;
     if (raw < 3) raw = 3;
-    if (raw > std.math.maxInt(u16) - 1) raw = std.math.maxInt(u16) - 1;
+    if (raw > std.math.maxInt(u8)) raw = std.math.maxInt(u8);
     return raw;
 }
 
@@ -1130,67 +1311,73 @@ fn safetyChecks() bool {
     };
 }
 
-fn narrowLen(x: usize) u16 {
-    std.debug.assert(x <= std.math.maxInt(u16));
-    return @as(u16, @intCast(x));
+fn narrowLen(x: usize) u8 {
+    std.debug.assert(x <= std.math.maxInt(u8));
+    return @as(u8, @intCast(x));
 }
 
-fn narrowPos(x: usize) u16 {
-    std.debug.assert(x <= std.math.maxInt(u16));
-    return @as(u16, @intCast(x));
+fn narrowPos(x: usize) u8 {
+    std.debug.assert(x <= std.math.maxInt(u8));
+    return @as(u8, @intCast(x));
 }
 
 inline fn childAt(n: anytype, idx: usize) *@TypeOf(n.*) {
-    std.debug.assert(idx <= @as(usize, n.len));
-    return n.children.?[idx].?;
+    std.debug.assert(idx <= n.count());
+    if (@typeInfo(@TypeOf(n)).pointer.is_const) {
+        return n.childArrayConst()[idx].?;
+    }
+    return n.childArray()[idx].?;
 }
 
 fn shiftEntriesRight(n: anytype, start: usize) void {
-    var i = @as(usize, n.len);
+    var i = n.count();
     while (i > start) : (i -= 1) {
         n.entries[i] = n.entries[i - 1];
     }
 }
 
 fn shiftChildrenRight(n: anytype, start: usize) void {
-    var i = @as(usize, n.len) + 1;
+    var i = n.count() + 1;
+    const children = n.childArray();
     while (i > start) : (i -= 1) {
-        n.children.?[i] = n.children.?[i - 1];
+        children[i] = children[i - 1];
     }
 }
 
 inline fn insertEntryAt(n: anytype, idx: usize, entry: @TypeOf(n.entries[0])) void {
-    std.debug.assert(@as(usize, n.len) < n.entries.len);
+    std.debug.assert(n.count() < n.capacity());
     shiftEntriesRight(n, idx);
     n.entries[idx] = entry;
-    n.len += 1;
+    n.header.finish += 1;
 }
 
 inline fn removeEntryAt(n: anytype, idx: usize) void {
-    std.debug.assert(idx < @as(usize, n.len));
+    std.debug.assert(idx < n.count());
     var i = idx;
-    while (i + 1 < @as(usize, n.len)) : (i += 1) {
+    while (i + 1 < n.count()) : (i += 1) {
         n.entries[i] = n.entries[i + 1];
     }
-    n.len -= 1;
+    n.header.finish -= 1;
 }
 
 fn removeChildAt(n: anytype, idx: usize) void {
-    std.debug.assert(idx <= @as(usize, n.len) + 1);
+    std.debug.assert(idx <= n.count() + 1);
     var i = idx;
-    while (i + 1 <= @as(usize, n.len) + 1) : (i += 1) {
-        n.children.?[i] = n.children.?[i + 1];
+    const children = n.childArray();
+    while (i + 1 <= n.count() + 1) : (i += 1) {
+        children[i] = children[i + 1];
     }
-    n.children.?[@as(usize, n.len) + 1] = null;
+    children[n.count() + 1] = null;
 }
 
 fn fixChildPositions(parent: anytype, start: usize) void {
-    if (parent.leaf) return;
+    if (parent.isLeaf()) return;
     var i = start;
-    while (i <= @as(usize, parent.len)) : (i += 1) {
-        if (parent.children.?[i]) |c| {
-            c.parent = parent;
-            c.position = narrowPos(i);
+    const children = parent.childArray();
+    while (i <= parent.count()) : (i += 1) {
+        if (children[i]) |c| {
+            c.header.parent = parent;
+            c.header.position = narrowPos(i);
         }
     }
 }
@@ -1199,21 +1386,23 @@ fn borrowFromLeft(parent: anytype, idx: usize) void {
     const child = childAt(parent, idx);
     const left = childAt(parent, idx - 1);
     std.debug.assert(left.count() > parentContextMinSlots(parent));
-    std.debug.assert(child.count() < child.entries.len);
+    std.debug.assert(child.count() < child.capacity());
 
     shiftEntriesRight(child, 0);
-    if (!child.leaf) {
+    if (!child.isLeaf()) {
         shiftChildrenRight(child, 0);
-        const moved_child = left.children.?[left.count()].?;
-        child.children.?[0] = moved_child;
-        moved_child.parent = child;
-        moved_child.position = 0;
-        left.children.?[left.count()] = null;
+        const left_children = left.childArray();
+        const child_children = child.childArray();
+        const moved_child = left_children[left.count()].?;
+        child_children[0] = moved_child;
+        moved_child.header.parent = child;
+        moved_child.header.position = 0;
+        left_children[left.count()] = null;
     }
     child.entries[0] = parent.entries[idx - 1];
-    child.len += 1;
+    child.header.finish += 1;
     parent.entries[idx - 1] = left.entries[left.count() - 1];
-    left.len -= 1;
+    left.header.finish -= 1;
     fixChildPositions(child, 0);
 }
 
@@ -1221,25 +1410,28 @@ fn borrowFromRight(parent: anytype, idx: usize) void {
     const child = childAt(parent, idx);
     const right = childAt(parent, idx + 1);
     std.debug.assert(right.count() > parentContextMinSlots(parent));
-    std.debug.assert(child.count() < child.entries.len);
+    std.debug.assert(child.count() < child.capacity());
 
     const child_len = child.count();
     child.entries[child_len] = parent.entries[idx];
-    if (!child.leaf) {
-        const moved_child = right.children.?[0].?;
-        child.children.?[child_len + 1] = moved_child;
-        moved_child.parent = child;
-        moved_child.position = narrowPos(child_len + 1);
+    if (!child.isLeaf()) {
+        const right_children = right.childArray();
+        const child_children = child.childArray();
+        const moved_child = right_children[0].?;
+        child_children[child_len + 1] = moved_child;
+        moved_child.header.parent = child;
+        moved_child.header.position = narrowPos(child_len + 1);
     }
-    child.len += 1;
+    child.header.finish += 1;
     parent.entries[idx] = right.entries[0];
     removeEntryAt(right, 0);
-    if (!right.leaf) {
+    if (!right.isLeaf()) {
         var j: usize = 0;
+        const right_children = right.childArray();
         while (j <= right.count()) : (j += 1) {
-            right.children.?[j] = right.children.?[j + 1];
+            right_children[j] = right_children[j + 1];
         }
-        right.children.?[right.count() + 1] = null;
+        right_children[right.count() + 1] = null;
         fixChildPositions(right, 0);
     }
 }
@@ -1249,7 +1441,7 @@ fn parentContextMinSlots(parent: anytype) usize {
 }
 
 fn countNodes(n: anytype, leaf_nodes: *usize, internal_nodes: *usize) void {
-    if (n.leaf) {
+    if (n.isLeaf()) {
         leaf_nodes.* += 1;
         return;
     }
@@ -1267,8 +1459,9 @@ fn validateNode(
     counted: *usize,
 ) usize {
     std.debug.assert(n.count() > 0);
-    std.debug.assert(n.count() <= n.entries.len);
-    if (n.parent != null) std.debug.assert(n.count() >= n.entries.len / 2);
+    std.debug.assert(n.count() <= n.capacity());
+    std.debug.assert(n.header.start == 0);
+    if (n.header.parent != null) std.debug.assert(n.count() >= n.entries.len / 2);
     if (lo) |l| std.debug.assert(tree.less(l, &n.entries[0].key));
     if (hi) |h| std.debug.assert(tree.less(&n.entries[n.count() - 1].key, h));
     var i: usize = 1;
@@ -1276,14 +1469,14 @@ fn validateNode(
         std.debug.assert(tree.less(&n.entries[i - 1].key, &n.entries[i].key));
     }
     counted.* += n.count();
-    if (n.leaf) return depth;
+    if (n.isLeaf()) return depth;
 
     var leaf_depth: ?usize = null;
     i = 0;
     while (i <= n.count()) : (i += 1) {
         const c = childAt(n, i);
-        std.debug.assert(c.parent == n);
-        std.debug.assert(@as(usize, c.position) == i);
+        std.debug.assert(c.header.parent == n);
+        std.debug.assert(@as(usize, c.header.position) == i);
         const child_lo = if (i == 0) lo else &n.entries[i - 1].key;
         const child_hi = if (i == n.count()) hi else &n.entries[i].key;
         const d = validateNode(tree, c, child_lo, child_hi, depth + 1, counted);
@@ -1293,6 +1486,17 @@ fn validateNode(
 }
 
 // Focused unit tests.  More stress tests are in test/btree_stress.zig.
+test "BTreeMap u64 node layout matches Abseil full-node layout" {
+    const testing = std.testing;
+    const Map = AutoBTreeMapWithConfig(u64, u64, .{ .target_node_size = 256 });
+
+    try testing.expectEqual(@as(usize, 15), Map.max_node_slots);
+    try testing.expectEqual(@as(usize, 16), Map.node_entry_offset);
+    try testing.expectEqual(@as(usize, 256), Map.leaf_node_size);
+    try testing.expectEqual(@as(usize, 256), Map.child_array_offset);
+    try testing.expectEqual(@as(usize, 384), Map.internal_node_size);
+}
+
 test "BTreeMap ordered insert, lookup, iteration, lower bound" {
     const testing = std.testing;
     var map = AutoBTreeMapWithConfig(u32, u32, .{ .target_node_size = 128 }).init(testing.allocator);
@@ -1370,7 +1574,84 @@ test "BTreeMap duplicate insert does not split full root" {
     map.validate();
 }
 
-test "BTreeMap absent remove does not rebalance" {
+test "BTreeMap duplicate insert does not rebalance full child" {
+    const testing = std.testing;
+    const Map = AutoBTreeMapWithConfig(u32, u32, .{ .target_node_size = 64 });
+    var map = Map.init(testing.allocator);
+    defer map.deinit();
+
+    var i: u32 = 0;
+    while (i < 4096) : (i += 1) {
+        const key_ = (i * 37) % 4096;
+        try testing.expect((try map.insert(key_, key_)).inserted);
+    }
+    map.validate();
+
+    const duplicate = struct {
+        fn firstKey(n: anytype) u32 {
+            var cur = n;
+            while (!cur.isLeaf()) cur = childAt(cur, 0);
+            return cur.entries[0].key;
+        }
+
+        fn inFullChild(n: anytype, max_slots: usize) ?u32 {
+            if (n.isLeaf()) return null;
+            var child_index: usize = 0;
+            while (child_index <= n.count()) : (child_index += 1) {
+                const child = childAt(n, child_index);
+                if (child.count() == max_slots) return firstKey(child);
+                if (inFullChild(child, max_slots)) |key_| return key_;
+            }
+            return null;
+        }
+    }.inFullChild(map.root.?, Map.max_node_slots) orelse return error.SkipZigTest;
+
+    const before = map.stats();
+    const before_generation = map.generation;
+    const result = try map.insert(duplicate, 9999);
+    try testing.expect(!result.inserted);
+    try testing.expectEqual(duplicate, result.entry.key);
+    try testing.expectEqual(before.len, map.stats().len);
+    try testing.expectEqual(before.nodes, map.stats().nodes);
+    try testing.expectEqual(before_generation, map.generation);
+    map.validate();
+}
+
+test "BTreeMap insert rebalancing preserves iteration order" {
+    const testing = std.testing;
+    const Map = AutoBTreeMapWithConfig(u32, u32, .{ .target_node_size = 64 });
+    var map = Map.init(testing.allocator);
+    defer map.deinit();
+
+    var i: u32 = 0;
+    while (i < 512) : (i += 1) {
+        const key_ = (i * 37) % 512;
+        try testing.expect((try map.insert(key_, key_ + 1)).inserted);
+        if (i % 31 == 0) map.validate();
+    }
+    map.validate();
+
+    var it = map.iterator();
+    i = 0;
+    while (i < 512) : (i += 1) {
+        const entry = it.next().?;
+        try testing.expectEqual(i, entry.key);
+        try testing.expectEqual(i + 1, entry.value);
+    }
+    try testing.expect(it.next() == null);
+
+    var rit = map.reverseIterator();
+    i = 512;
+    while (i > 0) {
+        i -= 1;
+        const entry = rit.next().?;
+        try testing.expectEqual(i, entry.key);
+        try testing.expectEqual(i + 1, entry.value);
+    }
+    try testing.expect(rit.next() == null);
+}
+
+test "BTreeMap absent remove preserves contents" {
     const testing = std.testing;
     const Map = AutoBTreeMapWithConfig(u32, u32, .{ .target_node_size = 128 });
     var map = Map.init(testing.allocator);
@@ -1382,11 +1663,23 @@ test "BTreeMap absent remove does not rebalance" {
     }
     map.validate();
     const before = map.stats();
+    const before_generation = map.generation;
 
     try testing.expect(!map.remove(3333));
     try testing.expectEqual(before.len, map.stats().len);
-    try testing.expectEqual(before.nodes, map.stats().nodes);
+    if (map.stats().nodes != before.nodes) {
+        try testing.expect(map.generation != before_generation);
+    }
     map.validate();
+
+    var it = map.iterator();
+    i = 0;
+    while (i < 2000) : (i += 1) {
+        const entry = it.next().?;
+        try testing.expectEqual(i * 2, entry.key);
+        try testing.expectEqual(i, entry.value);
+    }
+    try testing.expect(it.next() == null);
 }
 
 test "BTreeMap fetchRemove returns erased entry" {

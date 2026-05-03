@@ -11,8 +11,8 @@ pub fn main() !void {
     const keys = try allocator.alloc(u64, n);
     defer allocator.free(keys);
 
-    var prng = std.Random.DefaultPrng.init(0x5eed_b7ee);
-    for (keys) |*key| key.* = prng.random().int(u64);
+    var key_state: u64 = 0x5eed_b7ee;
+    for (keys) |*key| key.* = nextKey(&key_state);
 
     var map = Map.init(allocator);
     defer map.deinit();
@@ -77,4 +77,12 @@ fn nowNs() u64 {
     const rc = std.os.linux.clock_gettime(.MONOTONIC, &ts);
     std.debug.assert(rc == 0);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn nextKey(state: *u64) u64 {
+    state.* +%= 0x9E37_79B9_7F4A_7C15;
+    var z = state.*;
+    z = (z ^ (z >> 30)) *% 0xBF58_476D_1CE4_E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D0_49BB_1331_11EB;
+    return z ^ (z >> 31);
 }

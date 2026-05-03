@@ -214,8 +214,9 @@ pub fn FlatHashMap(
             const h = hashFn(self.context, key);
             const fp = fingerprint(h);
             var first_deleted: ?usize = null;
-            var index = startIndex(self.entries.len, h);
-            while (true) : (index = nextGroupIndex(self.entries.len, index)) {
+            var probe = ProbeSeq.init(self.entries.len, h);
+            while (true) : (probe.next()) {
+                const index = probe.offset;
                 const first_ctrl = self.ctrl[index];
                 if (first_ctrl == empty) {
                     const target = if (first_deleted) |deleted_slot| target: {
@@ -441,8 +442,9 @@ pub fn FlatHashMap(
         fn insertRehashed(self: *Self, key: Key) usize {
             const h = hashFn(self.context, key);
             const fp = fingerprint(h);
-            var index = startIndex(self.entries.len, h);
-            while (true) : (index = nextGroupIndex(self.entries.len, index)) {
+            var probe = ProbeSeq.init(self.entries.len, h);
+            while (true) : (probe.next()) {
+                const index = probe.offset;
                 if (self.ctrl[index] == empty) {
                     self.setCtrl(index, fp);
                     self.entries[index].key = key;
@@ -468,8 +470,9 @@ pub fn FlatHashMap(
             if (self.entries.len == 0) return null;
             const h = hashFn(self.context, key);
             const fp = fingerprint(h);
-            var index = startIndex(self.entries.len, h);
-            while (true) : (index = nextGroupIndex(self.entries.len, index)) {
+            var probe = ProbeSeq.init(self.entries.len, h);
+            while (true) : (probe.next()) {
+                const index = probe.offset;
                 const group = Group.load(self.ctrl, index);
                 if (group.firstByte() == fp) {
                     if (eqlFn(self.context, self.entries[index].key, key)) return index;
@@ -898,9 +901,23 @@ inline fn startIndex(capacity: usize, hash: u64) usize {
     return @as(usize, @intCast((hash >> 7) & @as(u64, @intCast(capacity - 1))));
 }
 
-inline fn nextGroupIndex(capacity: usize, index: usize) usize {
-    return (index + group_width) & (capacity - 1);
-}
+const ProbeSeq = struct {
+    mask: usize,
+    offset: usize,
+    index: usize = 0,
+
+    inline fn init(capacity: usize, hash: u64) ProbeSeq {
+        return .{
+            .mask = capacity - 1,
+            .offset = startIndex(capacity, hash),
+        };
+    }
+
+    inline fn next(seq: *ProbeSeq) void {
+        seq.index +%= group_width;
+        seq.offset = (seq.offset +% seq.index) & seq.mask;
+    }
+};
 
 inline fn slotAt(capacity: usize, base: usize, bit: usize) usize {
     return (base + bit) & (capacity - 1);
@@ -975,6 +992,23 @@ fn repeatedByte(comptime byte: u8) GroupMask {
         out |= @as(GroupMask, byte) << @intCast(i * 8);
     }
     return out;
+}
+
+test "probe sequence uses upstream group stepping" {
+    const capacity: usize = 128;
+    const hash: u64 = 0x1234_5678_9abc_def0;
+    const mask = capacity - 1;
+    var expected = startIndex(capacity, hash);
+    var delta: usize = 0;
+    var seq = ProbeSeq.init(capacity, hash);
+
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        try std.testing.expectEqual(expected, seq.offset);
+        delta +%= group_width;
+        expected = (expected +% delta) & mask;
+        seq.next();
+    }
 }
 
 pub fn defaultHash(comptime Key: type) fn (void, Key) u64 {

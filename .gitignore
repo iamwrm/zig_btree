@@ -19,3 +19,5 @@ Thumbs.db
 .idea/
 .vscode/
 zig_btree.tar.gz
+zig_parquet/tmp/
+__pycache__/
