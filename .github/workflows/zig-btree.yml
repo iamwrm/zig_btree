@@ -9,6 +9,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    env:
+      ZIG_VERSION: 0.17.0-dev.135+9df02121d
+      ZIG: ../.toolchains/zig-x86_64-linux-0.17.0-dev.135+9df02121d/zig
+      BENCH_RUNS: 3
+
     defaults:
       run:
         working-directory: zig_btree
@@ -17,10 +22,88 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.2
 
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v2.2.1
-        with:
-          version: latest
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl g++ libabsl-dev python3 xz-utils
+
+      - name: Download pinned Zig toolchain
+        run: |
+          mkdir -p ../.toolchains
+          curl -fsSL "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "../.toolchains/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar -C ../.toolchains -xf "../.toolchains/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          "${ZIG}" version
 
       - name: Run tests
-        run: zig build test
+        run: '"${ZIG}" build test'
+
+      - name: Build C++ Abseil btree benchmark
+        run: |
+          g++ -O3 -DNDEBUG -std=c++17 \
+            bench/abseil_btree_bench.cc \
+            -o ../.toolchains/abseil_btree_bench
+
+      - name: Run Zig benchmark
+        run: |
+          set -o pipefail
+          : > zig-btree-bench.txt
+          for i in $(seq 1 "${BENCH_RUNS}"); do
+            echo "### Zig run ${i}" | tee -a zig-btree-bench.txt
+            "${ZIG}" build -Doptimize=ReleaseFast bench 2>&1 | tee -a zig-btree-bench.txt
+          done
+
+      - name: Run C++ Abseil btree benchmark
+        run: |
+          set -o pipefail
+          : > cpp-abseil-btree-bench.txt
+          for i in $(seq 1 "${BENCH_RUNS}"); do
+            echo "### C++ Abseil btree run ${i}" | tee -a cpp-abseil-btree-bench.txt
+            ../.toolchains/abseil_btree_bench | tee -a cpp-abseil-btree-bench.txt
+          done
+
+      - name: Compare benchmark output
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from statistics import median
+          import os
+          import re
+
+          def parse(path):
+              out = {}
+              for line in Path(path).read_text().splitlines():
+                  m = re.match(r"(insert|lookup|iterate|remove):\s+([0-9.]+) ns/(?:op|item)", line)
+                  if m:
+                      out.setdefault(m.group(1), []).append(float(m.group(2)))
+              return out
+
+          zig = parse("zig-btree-bench.txt")
+          cpp = parse("cpp-abseil-btree-bench.txt")
+          keys = ["insert", "lookup", "iterate", "remove"]
+
+          lines = [
+              "# zig_btree vs C++ Abseil btree medians",
+              "",
+              f"Each implementation ran {os.environ['BENCH_RUNS']} benchmark samples.",
+              "",
+              "| workload | Zig median | C++ Abseil btree median | Zig gap | Zig samples | C++ samples |",
+              "| --- | ---: | ---: | ---: | ---: | ---: |",
+          ]
+          for key in keys:
+              zsamples = zig.get(key, [])
+              csamples = cpp.get(key, [])
+              if not zsamples or not csamples:
+                  lines.append(f"| `{key}` | missing | missing | n/a | {len(zsamples)} | {len(csamples)} |")
+                  continue
+              zv = median(zsamples)
+              cv = median(csamples)
+              gap = ((zv / cv) - 1.0) * 100.0
+              lines.append(f"| `{key}` | {zv:.3f} ns | {cv:.3f} ns | {gap:+.1f}% | {len(zsamples)} | {len(csamples)} |")
+
+          summary = "\n".join(lines) + "\n"
+          print(summary)
+          Path("benchmark-summary.md").write_text(summary)
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as f:
+              f.write(summary)
+          PY
