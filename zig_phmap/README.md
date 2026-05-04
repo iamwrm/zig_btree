@@ -17,6 +17,12 @@ The flat containers use contiguous entry storage, one control byte per slot, 7-b
 
 The node containers use the same hash index with separately allocated nodes, so value and entry pointers stay stable across table rehashes.
 
+## Layout
+
+- `src/phmap.zig` contains the public map/set APIs and container logic.
+- `src/defaults.zig` contains the default hash and equality policies used by the `Auto*` aliases.
+- `test/phmap_basic.zig` covers public API behavior; `test/phmap_stress.zig` covers randomized and allocation-stress scenarios.
+
 ## In Progress
 
 - `Parallel*` sharded containers: not yet implemented. The planned design is fixed shard count selected from high hash bits, one flat or node container per shard, and per-shard locks for mutating operations.

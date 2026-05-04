@@ -43,6 +43,21 @@ fn compare(ctx: *const Context, a: *const Key, b: *const Key) std.math.Order
 
 The container does not own resources inside keys or values.  If stored values need cleanup, iterate and clean them before `clear()` or `deinit()`.
 
+## Layout
+
+- `src/btree.zig` contains the map/set implementation and focused unit tests.
+- `test/btree_stress.zig` runs randomized model checks against a sorted list.
+- `bench/btree_bench.zig` is the Zig microbenchmark used for local and CI perf checks.
+- `tools/compare_bench.py` compares Zig benchmark logs with the C++ Abseil benchmark and writes the GitHub Actions summary.
+
+The implementation stays in one source file intentionally: the map and set
+types are comptime-generated, and their node layout, cursor types, mutation
+helpers, and invariant checks share private generic state.  Splitting those
+internals across files would add indirection without a clearer ownership
+boundary.  The surrounding build, stress, benchmark, and comparison tooling is
+kept separate so correctness and performance checks remain easy to run and
+maintain.
+
 ## Tests
 
 With the uploaded Zig toolchain extracted, run:
@@ -60,6 +75,13 @@ zig test src/btree.zig
 The stress tests import the package module, so `zig build test` is the
 recommended way to run the complete suite.
 
+For narrower local checks:
+
+```sh
+zig build unit-test
+zig build stress-test
+```
+
 ## Benchmark
 
 ```sh
@@ -67,4 +89,9 @@ zig build -Doptimize=ReleaseFast bench
 ```
 
 The benchmark reports insert, lookup, ordered iteration, and remove throughput
-for randomized `u64` keys.
+for randomized `u64` keys.  The default workload is 1,000,000 items; pass a
+positional item count after `--` for smaller smoke runs:
+
+```sh
+zig build -Doptimize=ReleaseFast bench -- 100000
+```

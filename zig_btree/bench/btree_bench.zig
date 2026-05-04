@@ -2,11 +2,12 @@ const std = @import("std");
 const btree = @import("btree");
 
 const Map = btree.AutoBTreeMapWithConfig(u64, u64, .{ .target_node_size = 256 });
+const default_items = 1_000_000;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
 
-    const n = 1_000_000;
+    const n = try parseItemCount(init.minimal.args);
 
     const keys = try allocator.alloc(u64, n);
     defer allocator.free(keys);
@@ -85,4 +86,15 @@ fn nextKey(state: *u64) u64 {
     z = (z ^ (z >> 30)) *% 0xBF58_476D_1CE4_E5B9;
     z = (z ^ (z >> 27)) *% 0x94D0_49BB_1331_11EB;
     return z ^ (z >> 31);
+}
+
+fn parseItemCount(process_args: std.process.Args) !usize {
+    var args = std.process.Args.Iterator.init(process_args);
+    _ = args.next();
+    const first = args.next() orelse return default_items;
+    if (args.next() != null) return error.TooManyArguments;
+
+    const n = try std.fmt.parseInt(usize, first, 10);
+    if (n == 0) return error.ZeroItems;
+    return n;
 }

@@ -583,98 +583,47 @@ pub fn BTreeMap(
             return out;
         }
 
+        const BoundKind = enum { lower, upper };
+
         /// Lower bound: first entry whose key is not less than key.
         pub fn lowerBound(self: *const Self, key_: Key) ConstCursor {
-            var last_internal: ?struct { node: *const Node, index: usize } = null;
-            var n_opt = self.root;
-            while (n_opt) |n| {
-                const i = self.lowerBoundInNode(n, &key_);
-                if (i < n.count()) last_internal = .{ .node = n, .index = i };
-                if (n.isLeaf()) {
-                    if (i < n.count()) return self.cursorAtConst(n, i);
-                    if (last_internal) |li| return self.cursorAtConst(li.node, li.index);
-                    return self.endCursor();
-                }
-                n_opt = childAt(n, i);
-            }
-            return self.endCursor();
+            return self.boundCursor(key_, .lower);
         }
 
         /// Mutable lower bound variant for callers that need to edit values in place.
         pub fn lowerBoundMut(self: *Self, key_: Key) Cursor {
-            var last_internal: ?struct { node: *Node, index: usize } = null;
-            var n_opt = self.root;
-            while (n_opt) |n| {
-                const i = self.lowerBoundInNode(n, &key_);
-                if (i < n.count()) last_internal = .{ .node = n, .index = i };
-                if (n.isLeaf()) {
-                    if (i < n.count()) return self.cursorAt(n, i);
-                    if (last_internal) |li| return self.cursorAt(li.node, li.index);
-                    return self.endCursorMut();
-                }
-                n_opt = childAt(n, i);
-            }
-            return self.endCursorMut();
+            return self.boundCursor(key_, .lower);
         }
 
         /// Upper bound: first entry whose key is greater than key.
         pub fn upperBound(self: *const Self, key_: Key) ConstCursor {
-            var last_internal: ?struct { node: *const Node, index: usize } = null;
-            var n_opt = self.root;
-            while (n_opt) |n| {
-                const i = self.upperBoundInNode(n, &key_);
-                if (i < n.count()) last_internal = .{ .node = n, .index = i };
-                if (n.isLeaf()) {
-                    if (i < n.count()) return self.cursorAtConst(n, i);
-                    if (last_internal) |li| return self.cursorAtConst(li.node, li.index);
-                    return self.endCursor();
-                }
-                n_opt = childAt(n, i);
-            }
-            return self.endCursor();
+            return self.boundCursor(key_, .upper);
         }
 
         /// Mutable upper bound variant for callers that need to edit values in place.
         pub fn upperBoundMut(self: *Self, key_: Key) Cursor {
-            var last_internal: ?struct { node: *Node, index: usize } = null;
-            var n_opt = self.root;
-            while (n_opt) |n| {
-                const i = self.upperBoundInNode(n, &key_);
-                if (i < n.count()) last_internal = .{ .node = n, .index = i };
-                if (n.isLeaf()) {
-                    if (i < n.count()) return self.cursorAt(n, i);
-                    if (last_internal) |li| return self.cursorAt(li.node, li.index);
-                    return self.endCursorMut();
-                }
-                n_opt = childAt(n, i);
-            }
-            return self.endCursorMut();
+            return self.boundCursor(key_, .upper);
         }
 
         pub fn findCursor(self: *const Self, key_: Key) ConstCursor {
-            var n_opt = self.root;
-            while (n_opt) |n| {
-                const i = self.lowerBoundInNode(n, &key_);
-                if (i < n.count() and self.keysEqual(&key_, &n.entries[i].key)) {
-                    return self.cursorAtConst(n, i);
-                }
-                if (n.isLeaf()) break;
-                n_opt = childAt(n, i);
-            }
-            return self.endCursor();
+            return self.findCursorImpl(key_);
         }
 
         pub fn findCursorMut(self: *Self, key_: Key) Cursor {
+            return self.findCursorImpl(key_);
+        }
+
+        fn findCursorImpl(self: anytype, key_: Key) SearchCursor(@TypeOf(self)) {
             var n_opt = self.root;
             while (n_opt) |n| {
                 const i = self.lowerBoundInNode(n, &key_);
                 if (i < n.count() and self.keysEqual(&key_, &n.entries[i].key)) {
-                    return self.cursorAt(n, i);
+                    return self.cursorAtSearchResult(n, i);
                 }
                 if (n.isLeaf()) break;
                 n_opt = childAt(n, i);
             }
-            return self.endCursorMut();
+            return self.endSearchCursor();
         }
 
         pub fn iterator(self: *Self) Iterator {
@@ -765,6 +714,45 @@ pub fn BTreeMap(
 
         fn cursorAtConst(self: *const Self, n: *const Node, index: usize) ConstCursor {
             return .{ .tree = self, .node = n, .index = index, .generation = self.generation };
+        }
+
+        fn boundCursor(self: anytype, key_: Key, comptime kind: BoundKind) SearchCursor(@TypeOf(self)) {
+            const is_const = @typeInfo(@TypeOf(self)).pointer.is_const;
+            const NodePtr = if (is_const) *const Node else *Node;
+            var last_internal: ?struct { node: NodePtr, index: usize } = null;
+            var n_opt = self.root;
+            while (n_opt) |n| {
+                const i = switch (kind) {
+                    .lower => self.lowerBoundInNode(n, &key_),
+                    .upper => self.upperBoundInNode(n, &key_),
+                };
+                if (i < n.count()) last_internal = .{ .node = n, .index = i };
+                if (n.isLeaf()) {
+                    if (i < n.count()) return self.cursorAtSearchResult(n, i);
+                    if (last_internal) |li| return self.cursorAtSearchResult(li.node, li.index);
+                    return self.endSearchCursor();
+                }
+                n_opt = childAt(n, i);
+            }
+            return self.endSearchCursor();
+        }
+
+        fn SearchCursor(comptime SelfPtr: type) type {
+            return if (@typeInfo(SelfPtr).pointer.is_const) ConstCursor else Cursor;
+        }
+
+        fn cursorAtSearchResult(self: anytype, n: anytype, index: usize) SearchCursor(@TypeOf(self)) {
+            if (@typeInfo(@TypeOf(self)).pointer.is_const) {
+                return self.cursorAtConst(n, index);
+            }
+            return self.cursorAt(n, index);
+        }
+
+        fn endSearchCursor(self: anytype) SearchCursor(@TypeOf(self)) {
+            if (@typeInfo(@TypeOf(self)).pointer.is_const) {
+                return self.endCursor();
+            }
+            return self.endCursorMut();
         }
 
         fn newNode(self: *Self, leaf: bool, parent: ?*Node, position: usize) Allocator.Error!*Node {
@@ -899,10 +887,6 @@ pub fn BTreeMap(
                 child = self.fillChild(n, child_index);
             }
             return self.deleteFromNode(child, key_, mutated);
-        }
-
-        fn containsInSubtree(self: *const Self, start: *const Node, key_: *const Key) bool {
-            return self.findEntryInSubtree(start, key_) != null;
         }
 
         fn findEntryInSubtree(self: *const Self, start: anytype, key_: *const Key) ?@TypeOf(&start.entries[0]) {
@@ -1783,6 +1767,15 @@ test "BTreeMap const and mutable cursor variants" {
     const m = map.lowerBoundMut(2);
     m.value().?.* = 200;
     try testing.expectEqual(@as(u32, 200), map.get(2).?.*);
+
+    const found = map.findCursorMut(1);
+    found.value().?.* = 100;
+    try testing.expectEqual(@as(u32, 100), map.get(1).?.*);
+    try testing.expect(map.findCursorMut(99).isEnd());
+
+    const upper = map.upperBoundMut(1);
+    upper.value().?.* = 220;
+    try testing.expectEqual(@as(u32, 220), map.get(2).?.*);
 }
 
 test "BTreeSet smoke" {

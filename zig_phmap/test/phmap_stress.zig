@@ -48,6 +48,53 @@ test "randomized model test against std.AutoHashMap" {
     map.validate();
 }
 
+test "node map randomized model test against std.AutoHashMap" {
+    const Map = phmap.AutoNodeHashMap(u64, u64);
+    var map = Map.init(std.testing.allocator);
+    defer map.deinit();
+
+    var model = std.AutoHashMap(u64, u64).init(std.testing.allocator);
+    defer model.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x9f1d_cafe);
+    const random = prng.random();
+
+    var i: usize = 0;
+    while (i < 25_000) : (i += 1) {
+        const key = random.int(u16);
+        switch (random.intRangeLessThan(u8, 0, 4)) {
+            0 => {
+                const value = random.int(u64);
+                _ = try map.put(key, value);
+                try model.put(key, value);
+            },
+            1 => {
+                const a = map.remove(key);
+                const b = model.remove(key);
+                try std.testing.expectEqual(b, a);
+            },
+            else => {
+                const a = map.getConst(key);
+                const b = model.get(key);
+                if (b) |value| {
+                    try std.testing.expect(a != null);
+                    try std.testing.expectEqual(value, a.?.*);
+                } else {
+                    try std.testing.expect(a == null);
+                }
+            },
+        }
+        if (i % 997 == 0) map.validate();
+    }
+
+    try std.testing.expectEqual(model.count(), map.len());
+    var it = model.iterator();
+    while (it.next()) |entry| {
+        try std.testing.expectEqual(entry.value_ptr.*, map.get(entry.key_ptr.*).?.*);
+    }
+    map.validate();
+}
+
 test "reserve shrink and tombstone churn" {
     var map = phmap.AutoFlatHashMap(u64, u64).init(std.testing.allocator);
     defer map.deinit();
