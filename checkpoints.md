@@ -2005,3 +2005,55 @@
   - Upstream `parallel_*` sharded containers remain out of scope for this single-table performance goal.
 - Stop condition:
   - Met. Zig `high_load_miss` is faster than C++ on final local aarch64 medians, the retained upstream-style probe sequence explains the improvement, secondary workload gaps are documented, all correctness gates are green, allocation-failure coverage is preserved, and node pointer stability is verified.
+
+## 2026-05-04T12:08:51+08:00 - Goal 0007 phmap lookup-miss alignment follow-up
+
+- Description: Improved `zig_phmap` lookup-miss comparison against C++ `parallel-hashmap` by making the control-byte allocation explicitly group-aligned. This preserves the existing portable 8-byte word group on local aarch64 while giving the hot lookup path the same alignment contract expected by group loads.
+- Changed files:
+  - `zig_phmap/src/phmap.zig`
+  - `checkpoints.md`
+- Implementation details:
+  - `FlatHashMap.ctrl` is now stored as `[]align(group_width) u8`.
+  - `rehash()` now allocates control bytes with `allocator.alignedAlloc(u8, .fromByteUnits(group_width), ...)`.
+  - Entry allocation, probing, H1/H2 derivation, tombstone policy, and node storage ownership are unchanged.
+- Correctness command:
+  - `cd /home/wr/gh/zig_tree && /home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test`: pass
+- Benchmark commands:
+  - `cd /home/wr/gh/zig_tree && g++ -O3 -DNDEBUG -std=c++17 -I .deps/parallel-hashmap-2.0.0 zig_phmap/bench/parallel_hashmap_bench.cc -o .deps/parallel_hashmap_bench`: pass
+  - `cd /home/wr/gh/zig_tree && /home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench` repeated seven times.
+  - `cd /home/wr/gh/zig_tree && .deps/parallel_hashmap_bench` repeated seven times.
+- Final local aarch64 7-sample median Zig benchmark:
+  - insert_reserved: 15.810 ns/op
+  - lookup_hit: 8.480 ns/op
+  - lookup_miss: 3.697 ns/op
+  - iterate: 2.011 ns/item
+  - mixed: 17.861 ns/op
+  - remove: 7.509 ns/op
+  - string_insert: 15.223 ns/op
+  - string_lookup: 10.979 ns/op
+  - high_load_miss: 14.769 ns/op
+  - tombstone_churn: 8.907 ns/op
+- Final local aarch64 7-sample median C++ benchmark:
+  - insert_reserved: 23.120 ns/op
+  - lookup_hit: 10.944 ns/op
+  - lookup_miss: 3.719 ns/op
+  - iterate: 4.115 ns/item
+  - mixed: 30.587 ns/op
+  - remove: 20.577 ns/op
+  - string_insert: 34.209 ns/op
+  - string_lookup: 17.482 ns/op
+  - high_load_miss: 15.660 ns/op
+  - tombstone_churn: 14.322 ns/op
+- Final percentage gaps, Zig versus C++ median:
+  - insert_reserved: Zig is 31.6% faster.
+  - lookup_hit: Zig is 22.5% faster.
+  - lookup_miss: Zig is 0.6% faster.
+  - iterate: Zig is 51.1% faster.
+  - mixed: Zig is 41.6% faster.
+  - remove: Zig is 63.5% faster.
+  - string_insert: Zig is 55.5% faster.
+  - string_lookup: Zig is 37.2% faster.
+  - high_load_miss: Zig is 5.7% faster.
+  - tombstone_churn: Zig is 37.8% faster.
+- Stop condition:
+  - Met for this follow-up. The requested `lookup_miss` median is now faster than the local C++ reference median, the C++ code reference was checked for group-load layout behavior, and the full Zig test step passes with allocation-failure and node-pointer-stability coverage still included.

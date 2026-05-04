@@ -63,7 +63,7 @@ pub fn FlatHashMap(
 
         allocator: Allocator,
         context: Context,
-        ctrl: []u8,
+        ctrl: []align(group_width) u8,
         entries: []Entry,
         count: usize,
         deleted_count: usize,
@@ -412,7 +412,7 @@ pub fn FlatHashMap(
 
         fn rehash(self: *Self, new_capacity: usize) !void {
             const new_cap = normalizeCapacity(new_capacity);
-            const new_ctrl = try self.allocator.alloc(u8, new_cap + group_width + 1);
+            const new_ctrl = try self.allocator.alignedAlloc(u8, .fromByteUnits(group_width), new_cap + group_width + 1);
             errdefer self.allocator.free(new_ctrl);
             const new_entries = try self.allocator.alloc(Entry, new_cap);
             errdefer self.allocator.free(new_entries);
