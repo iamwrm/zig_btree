@@ -131,7 +131,7 @@ Focus on:
 
 Required Abseil evidence:
 
-- Record the relevant Abseil source line ranges in `checkpoints.md`.
+- Record the relevant Abseil source line ranges in `zig_btree/checkpoints.md`.
 - Record Abseil's computed node slot count and leaf/internal allocation sizes for the benchmark key/value type.
 - Compare Abseil and Zig benchmark tree shape after insert: height, leaf nodes, internal nodes, fullness or equivalent occupancy, and bytes per stored item where available.
 - Inspect or generate local optimized assembly for the Abseil range-for iteration loop and the Zig benchmark iteration loop. Record only the specific differences that plausibly affect the measured gap.
@@ -145,7 +145,7 @@ Required Abseil evidence:
   - generated code quality and inlining
   - benchmark harness differences
 
-Record source-inspection findings in `checkpoints.md` before making performance changes.
+Record source-inspection findings in `zig_btree/checkpoints.md` before making performance changes.
 
 ## Optimization Direction
 
@@ -183,9 +183,9 @@ Run these gates from the `zig_btree/` package:
 
 ```sh
 cd /home/wr/gh/zig_tree/zig_btree
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseSafe test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast test
 ```
 
 Use this exact Zig toolchain unless a newer goal explicitly changes it.
@@ -211,13 +211,13 @@ Required local commands:
 
 ```sh
 cd /home/wr/gh/zig_tree/zig_btree
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast bench
 
 cd /home/wr/gh/zig_tree
 .deps/abseil_btree_bench
 ```
 
-If `.deps/abseil_btree_bench.cc` or the Abseil dependency changes, rebuild the C++ benchmark and record the exact build command in `checkpoints.md`.
+If `.deps/abseil_btree_bench.cc` or the Abseil dependency changes, rebuild the C++ benchmark and record the exact build command in `zig_btree/checkpoints.md`.
 
 Required workloads:
 
@@ -239,7 +239,7 @@ Required diagnostic measurements before major architecture changes:
 
 ## Checkpoint Requirements
 
-Update `checkpoints.md` after every meaningful step.
+Update `zig_btree/checkpoints.md` after every meaningful step.
 
 Each checkpoint must include:
 
@@ -268,7 +268,7 @@ Required checkpoints:
 
 ## Completion Criteria
 
-Produce a final `checkpoints.md` entry summarizing:
+Produce a final `zig_btree/checkpoints.md` entry summarizing:
 
 - starting local aarch64 Zig performance
 - ending local aarch64 Zig performance
@@ -284,4 +284,4 @@ Produce a final `checkpoints.md` entry summarizing:
 Stop only when either:
 
 - Zig `iterate` is within 20% of C++ Abseil on local aarch64 medians, `insert`/`lookup`/`remove` regressions are within the documented guardrails, and correctness gates are green, or
-- reaching the 20% `iterate` target requires a larger architecture change, and `checkpoints.md` clearly explains the blocker, the Abseil-backed reason for the blocker, and the proposed next design.
+- reaching the 20% `iterate` target requires a larger architecture change, and `zig_btree/checkpoints.md` clearly explains the blocker, the Abseil-backed reason for the blocker, and the proposed next design.

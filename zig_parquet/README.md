@@ -428,13 +428,13 @@ Raw statistic byte slices can be decoded with `Statistics.minPhysical` and
 Run Zig tests:
 
 ```sh
-../.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test
+../.toolchains/zig-aarch64-linux-0.16.0/zig build test
 ```
 
 From the repo root, build fixtures and run PyArrow compatibility:
 
 ```sh
-.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast
+.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast
 uv run --with pyarrow python zig_parquet/tools/verify_pyarrow.py
 uv run --with pyarrow python zig_parquet/tools/corpus_smoke.py
 uv run --with pyarrow python zig_parquet/tools/external_corpus_smoke.py

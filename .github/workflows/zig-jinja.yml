@@ -1,0 +1,37 @@
+name: zig_jinja
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    env:
+      ZIG_VERSION: 0.16.0
+      ZIG: .toolchains/zig-x86_64-linux-0.16.0/zig
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl xz-utils
+
+      - name: Download pinned Zig toolchain
+        run: |
+          mkdir -p .toolchains
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o ".toolchains/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          tar -C .toolchains -xf ".toolchains/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          "${ZIG}" version
+
+      - name: Run zig_jinja tests
+        run: |
+          "${ZIG}" build test --summary all
+          "${ZIG}" build jinja-test -Doptimize=Debug --summary all
+          "${ZIG}" build jinja-test -Doptimize=ReleaseSafe --summary all

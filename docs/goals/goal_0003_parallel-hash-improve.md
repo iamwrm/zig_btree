@@ -92,7 +92,7 @@ Focus on:
 - iterator implementation
 - resize and tombstone cleanup policy
 
-Record the findings in `checkpoints.md` before changing code.
+Record the findings in `zig_phmap/checkpoints.md` before changing code.
 
 ## Required Design Direction
 
@@ -123,7 +123,7 @@ Prefer a portable abstraction with target-specific fast paths.
 Minimum acceptable implementation:
 
 - A group abstraction that can be implemented with scalar fallback.
-- An optimized path for the current target if Zig 0.17 supports it cleanly.
+- An optimized path for the current target if Zig 0.16 supports it cleanly.
 
 Preferred implementation:
 
@@ -159,9 +159,9 @@ Add or expand tests for:
 Correctness gates that must pass:
 
 ```sh
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseSafe test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast test
 ```
 
 Use this exact Zig toolchain unless a newer goal explicitly changes it.
@@ -174,7 +174,7 @@ Required commands:
 
 ```sh
 g++ -O3 -DNDEBUG -std=c++17 -I .deps/parallel-hashmap-2.0.0 .deps/parallel_hashmap_bench.cc -o .deps/parallel_hashmap_bench
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast bench
 .deps/parallel_hashmap_bench
 ```
 
@@ -195,7 +195,7 @@ If the benchmark does not currently include tombstone churn and high-load-factor
 
 ## Checkpoint Requirements
 
-Update `checkpoints.md` after every meaningful step.
+Update `zig_phmap/checkpoints.md` after every meaningful step.
 
 Each checkpoint must include:
 
@@ -240,7 +240,7 @@ For each optimization, identify which factor moved:
 - better compiler vectorization
 - explicit vector operations
 
-If an optimization fails, keep the result in `checkpoints.md` and explain why it was rejected or reverted.
+If an optimization fails, keep the result in `zig_phmap/checkpoints.md` and explain why it was rejected or reverted.
 
 ## Completion Criteria
 
@@ -251,7 +251,7 @@ This goal is complete only when:
 - `iterate` is on-par with or faster than C++.
 - no other benchmark operation regresses by more than 10% from the Goal 0002 Zig baseline without documented justification.
 - all required correctness gates pass.
-- `checkpoints.md` contains the final parity audit.
+- `zig_phmap/checkpoints.md` contains the final parity audit.
 - the implementation remains allocator-aware and API-compatible with Goal 0002.
 
 Final checkpoint must include:

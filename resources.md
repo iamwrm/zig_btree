@@ -1,10 +1,10 @@
 ## Zig
 
 Source:
-https://ziglang.org/builds/zig-0.17.0-dev.135+9df02121d.tar.xz
+https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz
 
 Toolchain:
-https://ziglang.org/builds/zig-aarch64-linux-0.17.0-dev.135+9df02121d.tar.xz
+https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz
 
 ## Cpp
 

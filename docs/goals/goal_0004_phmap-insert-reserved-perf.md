@@ -91,7 +91,7 @@ Focus on:
 - growth-left accounting
 - resize/tombstone cleanup policy
 
-Record source-inspection findings in `checkpoints.md` before making performance changes.
+Record source-inspection findings in `zig_phmap/checkpoints.md` before making performance changes.
 
 ## Optimization Direction
 
@@ -118,9 +118,9 @@ All existing correctness behavior must remain intact.
 Correctness gates:
 
 ```sh
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseSafe test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast test
 ```
 
 Use this exact Zig toolchain unless a newer goal explicitly changes it.
@@ -143,7 +143,7 @@ Required local commands:
 
 ```sh
 g++ -O3 -DNDEBUG -std=c++17 -I .deps/parallel-hashmap-2.0.0 zig_phmap/bench/parallel_hashmap_bench.cc -o .deps/parallel_hashmap_bench
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast bench
 .deps/parallel_hashmap_bench
 ```
 
@@ -168,7 +168,7 @@ Required workloads to watch for regressions:
 
 ## Checkpoint Requirements
 
-Update `checkpoints.md` after every meaningful step.
+Update `zig_phmap/checkpoints.md` after every meaningful step.
 
 Each checkpoint must include:
 
@@ -195,7 +195,7 @@ Required checkpoints:
 
 ## Completion Criteria
 
-Produce a final `checkpoints.md` entry summarizing:
+Produce a final `zig_phmap/checkpoints.md` entry summarizing:
 
 - starting local aarch64 `insert_reserved` performance
 - ending local aarch64 `insert_reserved` performance
@@ -207,4 +207,4 @@ Produce a final `checkpoints.md` entry summarizing:
 Stop only when either:
 
 - Zig `insert_reserved` is on-par with or faster than C++ locally, with correctness gates green, or
-- further improvement requires a larger architecture change, and `checkpoints.md` clearly explains the blocker and the proposed next design.
+- further improvement requires a larger architecture change, and `zig_phmap/checkpoints.md` clearly explains the blocker and the proposed next design.

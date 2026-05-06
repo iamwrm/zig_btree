@@ -34,7 +34,7 @@ Create a Zig package for hash maps and hash sets inspired by `parallel-hashmap`,
   - `ParallelNodeHashMap`
   - `ParallelNodeHashSet`
 
-If the full parallel API requires more work than the first pass allows, implement the non-parallel flat/node containers first, then document the precise sharding/locking design and remaining work in `checkpoints.md`.
+If the full parallel API requires more work than the first pass allows, implement the non-parallel flat/node containers first, then document the precise sharding/locking design and remaining work in `zig_phmap/checkpoints.md`.
 
 ## Required Design Properties
 
@@ -94,9 +94,9 @@ Implement a broad test suite, not only smoke tests:
 Correctness gates that must stay green:
 
 ```sh
-.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test
-.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test
-.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test
+.toolchains/zig-aarch64-linux-0.16.0/zig build test
+.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseSafe test
+.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast test
 ```
 
 Use the exact Zig toolchain above unless a newer goal explicitly changes it.
@@ -124,11 +124,11 @@ Use the same key generation, operation ordering, and item counts for C++ and Zig
 Benchmark commands should be available through build steps, for example:
 
 ```sh
-.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench
+.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast bench
 .deps/parallel_hashmap_bench
 ```
 
-The exact C++ benchmark binary name may differ, but it must be recorded in `checkpoints.md`.
+The exact C++ benchmark binary name may differ, but it must be recorded in `zig_phmap/checkpoints.md`.
 
 ## Performance Target
 
@@ -152,7 +152,7 @@ Prefer production architecture over quick benchmark tricks:
 
 ## Record Keeping
 
-Create or update `checkpoints.md` at repo root after every meaningful step.
+Create or update `zig_phmap/checkpoints.md` after every meaningful step.
 
 Each checkpoint must include:
 
@@ -177,7 +177,7 @@ Use checkpoint entries for:
 
 ## Completion Criteria
 
-Produce a final `checkpoints.md` entry summarizing:
+Produce a final `zig_phmap/checkpoints.md` entry summarizing:
 
 - implemented containers and APIs
 - intentionally missing APIs, if any
@@ -193,7 +193,7 @@ Produce a final `checkpoints.md` entry summarizing:
 Stop only when either:
 
 - Zig is within approximately 20% of `parallel-hashmap` on most required operations, with correctness gates green, or
-- further improvements require a major redesign, and `checkpoints.md` clearly explains the blocker and proposed next architecture.
+- further improvements require a major redesign, and `zig_phmap/checkpoints.md` clearly explains the blocker and proposed next architecture.
 
 ## Completion Audit
 
@@ -203,5 +203,5 @@ Before marking the goal complete:
 - Map every requirement in this file to actual code, tests, benchmark output, or documented rationale.
 - Run the required correctness gates with the exact Zig toolchain.
 - Run the Zig and C++ benchmarks and record results.
-- Verify `checkpoints.md` includes the final summary and any remaining bottlenecks.
+- Verify `zig_phmap/checkpoints.md` includes the final summary and any remaining bottlenecks.
 - Treat uncertainty as incomplete; either verify more or document the blocker precisely.

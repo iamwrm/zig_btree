@@ -11,7 +11,7 @@ import pyarrow.parquet as pq
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TMP = ROOT / "zig_parquet" / "tmp"
-ZIG = ROOT / ".toolchains" / "zig-aarch64-linux-0.17.0-dev.135+9df02121d" / "zig"
+ZIG = ROOT / ".toolchains" / "zig-aarch64-linux-0.16.0" / "zig"
 ZIG_WRITER = ROOT / "zig-out" / "bin" / "parquet_write_sequence"
 ZIG_BENCH_READER = ROOT / "zig-out" / "bin" / "parquet_bench_read"
 

@@ -17,7 +17,7 @@ Implement a performance parity pass for the Zig B-tree against Abseil’s absl::
 
   Requirements:
 
-  1. Use the exact Zig toolchain at .toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig.
+  1. Use the exact Zig toolchain at .toolchains/zig-aarch64-linux-0.16.0/zig.
   2. Keep correctness green:
       - zig build test
       - zig build -Doptimize=ReleaseSafe test
@@ -39,7 +39,7 @@ Implement a performance parity pass for the Zig B-tree against Abseil’s absl::
   8. Add or update tests if an optimization changes internal invariants or edge behavior.
 
   Record keeping:
-  Create or update checkpoints.md at repo root after every meaningful step. Each checkpoint must include:
+  Create or update zig_btree/checkpoints.md after every meaningful step. Each checkpoint must include:
 
   - timestamp
   - short description of the change
@@ -53,7 +53,7 @@ Implement a performance parity pass for the Zig B-tree against Abseil’s absl::
 
 Completion criteria:
 
-  - Produce a final checkpoints.md entry summarizing:
+  - Produce a final zig_btree/checkpoints.md entry summarizing:
       - starting Zig performance
       - ending Zig performance
       - Abseil comparison
@@ -62,4 +62,4 @@ Completion criteria:
       - remaining known bottlenecks
   - Stop only when either:
       - Zig is within ~20% of Abseil on most operations, or
-      - further improvements require a major redesign, and checkpoints.md clearly explains the blocker and proposed next architecture.
+      - further improvements require a major redesign, and zig_btree/checkpoints.md clearly explains the blocker and proposed next architecture.

@@ -67,7 +67,7 @@ Do not copy Abseil code. Use Abseil as the architectural reference and implement
 
 ## Required Design Work
 
-Before implementation, write a design checkpoint in `checkpoints.md` that maps the Abseil structure to the Zig structure.
+Before implementation, write a design checkpoint in `zig_btree/checkpoints.md` that maps the Abseil structure to the Zig structure.
 
 Required Abseil features to map:
 
@@ -125,9 +125,9 @@ Run these gates from the `zig_btree/` package after every retained architecture 
 
 ```sh
 cd /home/wr/gh/zig_tree/zig_btree
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseSafe test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast test
 ```
 
 Add or update tests for:
@@ -154,7 +154,7 @@ Required local commands:
 
 ```sh
 cd /home/wr/gh/zig_tree/zig_btree
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast bench
 
 cd /home/wr/gh/zig_tree
 .deps/abseil_btree_bench
@@ -186,7 +186,7 @@ Required diagnostic measurements:
 
 ## Checkpoint Requirements
 
-Update `checkpoints.md` after every meaningful step.
+Update `zig_btree/checkpoints.md` after every meaningful step.
 
 Each checkpoint must include:
 
@@ -218,7 +218,7 @@ Required checkpoints:
 
 ## Completion Criteria
 
-Produce a final `checkpoints.md` entry summarizing:
+Produce a final `zig_btree/checkpoints.md` entry summarizing:
 
 - starting local aarch64 Zig performance
 - ending local aarch64 Zig performance
@@ -235,4 +235,4 @@ Produce a final `checkpoints.md` entry summarizing:
 Stop only when either:
 
 - Zig `iterate` is within 20% of C++ Abseil on local aarch64 medians, secondary workload gaps are documented, and correctness gates are green, or
-- the Abseil-style structure has been implemented far enough to test the hypothesis, and `checkpoints.md` clearly explains why performance still does not align and what non-Abseil architecture would be required next.
+- the Abseil-style structure has been implemented far enough to test the hypothesis, and `zig_btree/checkpoints.md` clearly explains why performance still does not align and what non-Abseil architecture would be required next.

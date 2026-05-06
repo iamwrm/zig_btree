@@ -70,7 +70,7 @@ Inspect upstream:
 
 - `.deps/parallel-hashmap-2.0.0/parallel_hashmap/phmap.h`
 
-Record concrete source locations in `checkpoints.md` for:
+Record concrete source locations in `zig_phmap/checkpoints.md` for:
 
 - `ctrl_t`, special control values, H1/H2 hash splitting
 - `probe_seq`
@@ -95,7 +95,7 @@ Record concrete source locations in `checkpoints.md` for:
 
 ## Required Design Mapping
 
-Write a design checkpoint in `checkpoints.md` before implementation that maps upstream C++ structure to Zig structure.
+Write a design checkpoint in `zig_phmap/checkpoints.md` before implementation that maps upstream C++ structure to Zig structure.
 
 Required upstream features to map:
 
@@ -163,9 +163,9 @@ Run these gates after every retained architecture stage:
 
 ```sh
 cd /home/wr/gh/zig_tree
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build test
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseSafe test
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseSafe test
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast test
 ```
 
 Use this exact Zig toolchain unless a newer goal explicitly changes it.
@@ -198,7 +198,7 @@ Required local commands:
 cd /home/wr/gh/zig_tree
 g++ -O3 -DNDEBUG -std=c++17 -I .deps/parallel-hashmap-2.0.0 zig_phmap/bench/parallel_hashmap_bench.cc -o .deps/parallel_hashmap_bench
 
-/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.17.0-dev.135+9df02121d/zig build -Doptimize=ReleaseFast bench
+/home/wr/gh/zig_tree/.toolchains/zig-aarch64-linux-0.16.0/zig build -Doptimize=ReleaseFast bench
 .deps/parallel_hashmap_bench
 ```
 
@@ -233,7 +233,7 @@ Required diagnostic measurements:
 
 ## Checkpoint Requirements
 
-Update `checkpoints.md` after every meaningful step.
+Update `zig_phmap/checkpoints.md` after every meaningful step.
 
 Each checkpoint must include:
 
@@ -266,7 +266,7 @@ Required checkpoints:
 
 ## Completion Criteria
 
-Produce a final `checkpoints.md` entry summarizing:
+Produce a final `zig_phmap/checkpoints.md` entry summarizing:
 
 - starting local aarch64 Zig performance
 - ending local aarch64 Zig performance
@@ -284,4 +284,4 @@ Produce a final `checkpoints.md` entry summarizing:
 Stop only when either:
 
 - Zig `high_load_miss` is on-par with or faster than C++ on local aarch64 medians, secondary workload gaps are documented, existing correctness gates are green, allocation-failure coverage is preserved, and node pointer stability is verified, or
-- the upstream-style structure has been implemented far enough to test the hypothesis, and `checkpoints.md` clearly explains why performance still does not align and what different design would be required next.
+- the upstream-style structure has been implemented far enough to test the hypothesis, and `zig_phmap/checkpoints.md` clearly explains why performance still does not align and what different design would be required next.

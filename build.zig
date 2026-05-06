@@ -16,6 +16,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const jinja_mod = b.addModule("jinja", .{
+        .root_source_file = b.path("zig_jinja/src/jinja.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const phmap_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig_phmap/src/phmap.zig"),
@@ -54,6 +60,25 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_parquet_smoke = b.addRunArtifact(parquet_smoke);
+
+    const jinja_unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig_jinja/src/jinja.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_jinja_unit_tests = b.addRunArtifact(jinja_unit_tests);
+
+    const jinja_compat_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig_jinja/test/jinja_compat.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "jinja", .module = jinja_mod }},
+        }),
+    });
+    const run_jinja_compat_tests = b.addRunArtifact(jinja_compat_tests);
 
     const parquet_write_fixture = b.addExecutable(.{
         .name = "parquet_write_fixture",
@@ -302,10 +327,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_phmap_stress_tests.step);
     test_step.dependOn(&run_parquet_unit_tests.step);
     test_step.dependOn(&run_parquet_smoke.step);
+    test_step.dependOn(&run_jinja_unit_tests.step);
+    test_step.dependOn(&run_jinja_compat_tests.step);
 
     const parquet_test_step = b.step("parquet-test", "Run parquet tests");
     parquet_test_step.dependOn(&run_parquet_unit_tests.step);
     parquet_test_step.dependOn(&run_parquet_smoke.step);
+
+    const jinja_test_step = b.step("jinja-test", "Run zig_jinja tests");
+    jinja_test_step.dependOn(&run_jinja_unit_tests.step);
+    jinja_test_step.dependOn(&run_jinja_compat_tests.step);
 
     const phmap_bench = b.addExecutable(.{
         .name = "phmap_bench",
